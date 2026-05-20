@@ -47,33 +47,58 @@ Create an API key from the SynapCores admin UI (default `http://localhost:8095`)
 
 ## Configure
 
-Add this entry to your `openclaw.config.json` (or whichever config path your OpenClaw install uses):
+Requires OpenClaw **`>=2026.4.10`**. Install the plugin, then add its config and
+give it the **memory slot**:
+
+```bash
+openclaw plugins install @synapcores/openclaw-memory
+```
+
+Add this to your OpenClaw config (run `openclaw config file` to find the path,
+typically `~/.openclaw/openclaw.json`). Three things matter: the
+`plugins.entries.<id>.config` nesting, the `plugins.allow` entry, and
+**`plugins.slots.memory`**:
 
 ```json
 {
   "plugins": {
-    "memory-synapcores": {
-      "embedding": {
-        "apiKey": "${OPENAI_API_KEY}",
-        "model": "text-embedding-3-small"
-      },
-      "synapcores": {
-        "host": "localhost",
-        "port": 8080,
-        "apiKey": "${SYNAPCORES_API_KEY}",
-        "useHttps": false
-      },
-      "collection": "openclaw_memories",
-      "graph": "openclaw_memory_graph",
-      "autoCapture": true,
-      "autoRecall": true,
-      "autoLinkSimilar": true
+    "allow": ["memory-synapcores"],
+    "slots": { "memory": "memory-synapcores" },
+    "entries": {
+      "memory-synapcores": {
+        "enabled": true,
+        "config": {
+          "embedding": {
+            "apiKey": "${OPENAI_API_KEY}",
+            "model": "text-embedding-3-small"
+          },
+          "synapcores": {
+            "host": "localhost",
+            "port": 8080,
+            "apiKey": "${SYNAPCORES_API_KEY}",
+            "useHttps": false
+          },
+          "collection": "openclaw_memories",
+          "graph": "openclaw_memory_graph",
+          "autoCapture": true,
+          "autoRecall": true,
+          "autoLinkSimilar": true
+        }
+      }
     }
   }
 }
 ```
 
-Environment-variable interpolation (`${OPENAI_API_KEY}`, `${SYNAPCORES_API_KEY}`) is supported in any string field so you don't have to commit secrets.
+> **You must set `plugins.slots.memory` to `"memory-synapcores"`.** Only one
+> plugin can own the memory slot, and the default is OpenClaw's built-in
+> `memory-core` — without claiming the slot the plugin loads but stays
+> **disabled**.
+
+Then `openclaw config validate`. Environment-variable interpolation
+(`${OPENAI_API_KEY}`, `${SYNAPCORES_API_KEY}`) is supported in any string field
+so you don't have to commit secrets. (Store keys **clean** — a trailing newline
+in `apiKey` will break auth.)
 
 ### Config fields
 

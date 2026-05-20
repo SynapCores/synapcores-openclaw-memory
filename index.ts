@@ -15,11 +15,11 @@
  * and switched API-key auth to `Authorization: Bearer`.
  */
 
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
-import { stringEnum } from "openclaw/plugin-sdk";
+import { stringEnum } from "openclaw/plugin-sdk/core";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { SynapCores } from "@synapcores/sdk";
 import type { VectorCollection, VectorHit } from "@synapcores/sdk";
@@ -133,6 +133,120 @@ const DEFAULT_COLLECTION = "openclaw_memories";
  * and `vectorCollection(name)` that target `/v1/vectors/collections/...`
  * directly, so the plugin no longer has to bypass the SDK.
  */
+// ============================================================================
+// Connection preflight
+//
+// This plugin is a CLIENT — it never installs or starts a SynapCores database.
+// The most common first-run failure is "installed the plugin, but the gateway
+// isn't running", which otherwise surfaces as a raw ECONNREFUSED. Preflight
+// turns that into an actionable message pointing at the installer + admin UI.
+// ============================================================================
+
+const PREFLIGHT_INSTALL_HINT =
+  "This plugin needs a running SynapCores gateway — it does not install one. " +
+  "Install + start the free Community Edition:\n" +
+  "  curl -fsSL https://synapcores.com/install.sh | sh\n" +
+  "  synapcores start\n" +
+  "Docs: https://synapcores.com/install";
+
+function httpStatusOf(err: unknown): number | undefined {
+  const e = err as {
+    status?: number;
+    statusCode?: number;
+    response?: { status?: number };
+  };
+  return e?.status ?? e?.statusCode ?? e?.response?.status;
+}
+
+// Raw transport-error fallback (used if the error isn't one of the SDK's typed
+// classes — e.g. a bare fetch/undici error).
+function isRawConnError(err: unknown): boolean {
+  const code = String((err as { code?: string })?.code ?? "");
+  const msg = String((err as { message?: string })?.message ?? err ?? "");
+  return (
+    [
+      "ECONNREFUSED",
+      "ENOTFOUND",
+      "ETIMEDOUT",
+      "ECONNRESET",
+      "EAI_AGAIN",
+      "EHOSTUNREACH",
+      "EHOSTDOWN",
+    ].includes(code) ||
+    /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|ECONNRESET|EHOSTUNREACH|getaddrinfo|fetch failed|network error|socket hang up|Failed to connect to SynapCores|Connection refused/i.test(
+      msg,
+    )
+  );
+}
+
+/**
+ * Classify a gateway error. The @synapcores/sdk normalises failures into typed
+ * errors that carry a stable `.code` ("CONNECTION_ERROR" / "AUTH_ERROR") and a
+ * `.name` ("ConnectionError" / "AuthenticationError" / "TimeoutError"); we key
+ * off those first, then fall back to raw transport heuristics + HTTP status.
+ */
+function classifyGatewayError(err: unknown): "connection" | "auth" | "other" {
+  const code = String((err as { code?: string })?.code ?? "");
+  const name = String((err as { name?: string })?.name ?? "");
+  const status = httpStatusOf(err);
+  if (
+    code === "CONNECTION_ERROR" ||
+    code === "TIMEOUT" ||
+    name === "ConnectionError" ||
+    name === "TimeoutError" ||
+    isRawConnError(err)
+  ) {
+    return "connection";
+  }
+  if (code === "AUTH_ERROR" || name === "AuthenticationError" || status === 401 || status === 403) {
+    return "auth";
+  }
+  return "other";
+}
+
+/**
+ * One lightweight round-trip to confirm the gateway is reachable AND the API
+ * key is accepted, before any memory operation runs. Throws an Error with an
+ * actionable message on failure; resolves on success. Uses
+ * `listVectorCollections()` (GET /v1/vectors/collections) — the same call
+ * MemoryDB makes first, and a known-good CE endpoint.
+ */
+async function preflightGateway(client: SynapCores): Promise<void> {
+  let host = "localhost";
+  let port = 8080;
+  let scheme = "http";
+  try {
+    const cfg = client._getConfig();
+    host = cfg.host ?? host;
+    port = cfg.port ?? port;
+    scheme = cfg.useHttps ? "https" : "http";
+  } catch {
+    // _getConfig is best-effort — only used to make the message specific.
+  }
+  const url = `${scheme}://${host}:${port}`;
+
+  try {
+    await client.listVectorCollections();
+  } catch (err) {
+    const kind = classifyGatewayError(err);
+    if (kind === "connection") {
+      throw new Error(`Cannot reach the SynapCores gateway at ${url}. ${PREFLIGHT_INSTALL_HINT}`);
+    }
+    if (kind === "auth") {
+      throw new Error(
+        `The SynapCores gateway at ${url} rejected the API key. ` +
+          `Create a FullAccess key in the admin UI (http://${host}:8095) and set ` +
+          `synapcores.apiKey (or the SYNAPCORES_API_KEY env var).`,
+      );
+    }
+    throw new Error(
+      `SynapCores preflight against ${url} failed: ${String(
+        (err as { message?: string })?.message ?? err,
+      )}`,
+    );
+  }
+}
+
 class MemoryDB {
   private readonly client: SynapCores;
   private vectorCollection: VectorCollection | null = null;
@@ -158,6 +272,10 @@ class MemoryDB {
   }
 
   private async doInitialize(): Promise<void> {
+    // Fail fast with an actionable message if the gateway is down or the key
+    // is wrong, before the collection probe muddies the error.
+    await preflightGateway(this.client);
+
     // Probe for an existing vector collection (idempotent). The SDK's
     // `listVectorCollections()` calls GET /v1/vectors/collections and
     // returns the bare array; we fall through to create() on any error.
@@ -1434,10 +1552,21 @@ const memoryPlugin = {
 
     api.registerService({
       id: "memory-synapcores",
-      start: () => {
-        api.logger.info(
-          `memory-synapcores: initialized (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, collection: ${collectionName}, model: ${cfg.embedding.model})`,
-        );
+      start: async () => {
+        // Best-effort startup probe: surface a DB-down / bad-key problem
+        // immediately in the logs (and `openclaw plugins doctor`) without
+        // bricking the host — memory ops still lazily retry on first use.
+        try {
+          await preflightGateway(client);
+          api.logger.info(
+            `memory-synapcores: initialized (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, collection: ${collectionName}, model: ${cfg.embedding.model})`,
+          );
+        } catch (err) {
+          api.logger.warn(`memory-synapcores: ${String((err as Error)?.message ?? err)}`);
+          api.logger.warn(
+            "memory-synapcores: continuing with lazy init — memory operations will retry on first use.",
+          );
+        }
       },
       stop: () => {
         api.logger.info("memory-synapcores: stopped");
@@ -1452,9 +1581,15 @@ const memoryPlugin = {
     // reach `recallFiltered` / `recallRelated` / `predictRelevance` /
     // `trainRelevanceModel` via the OpenClaw plugin registry
     // (e.g. `plugin.extensions.recallFiltered`).
-    (memoryPlugin as unknown as { extensions: MemorySynapCoresExtensions }).extensions =
-      extensions;
+    //
+    // NOTE: attach to `pluginEntry` (the definePluginEntry result that is the
+    // default export), NOT the inner `memoryPlugin` — definePluginEntry returns
+    // a fresh normalized object, so attaching to the inner one would hide the
+    // extensions from every consumer of the loaded plugin.
+    (pluginEntry as unknown as { extensions: MemorySynapCoresExtensions }).extensions = extensions;
   },
 };
 
-export default definePluginEntry(memoryPlugin);
+const pluginEntry = definePluginEntry(memoryPlugin);
+
+export default pluginEntry;
