@@ -1,0 +1,136 @@
+{
+  "id": "memory-synapcores",
+  "kind": "memory",
+  "commandAliases": [{ "name": "ltm" }],
+  "activation": {
+    "onStartup": false,
+    "onCommands": ["ltm"]
+  },
+  "contracts": {
+    "tools": ["memory_store", "memory_recall", "memory_forget"]
+  },
+  "uiHints": {
+    "embedding.apiKey": {
+      "label": "OpenAI API Key",
+      "sensitive": true,
+      "placeholder": "sk-proj-...",
+      "help": "API key for OpenAI embeddings (or use ${OPENAI_API_KEY})"
+    },
+    "embedding.model": {
+      "label": "Embedding Model",
+      "placeholder": "text-embedding-3-small",
+      "help": "OpenAI embedding model to use"
+    },
+    "synapcores.host": {
+      "label": "SynapCores Host",
+      "placeholder": "localhost",
+      "help": "Hostname of the SynapCores gateway"
+    },
+    "synapcores.port": {
+      "label": "SynapCores Port",
+      "placeholder": "8080",
+      "help": "Port of the SynapCores gateway"
+    },
+    "synapcores.apiKey": {
+      "label": "SynapCores API Key",
+      "sensitive": true,
+      "placeholder": "ak_prod_... or aidb_...",
+      "help": "API key for the SynapCores gateway (or use ${SYNAPCORES_API_KEY})"
+    },
+    "synapcores.useHttps": {
+      "label": "Use HTTPS",
+      "advanced": true,
+      "help": "Connect to the SynapCores gateway over TLS"
+    },
+    "collection": {
+      "label": "Memory Collection",
+      "placeholder": "openclaw_memories",
+      "advanced": true,
+      "help": "SynapCores collection name used to store memories"
+    },
+    "graph": {
+      "label": "Memory Graph",
+      "placeholder": "openclaw_memory_graph",
+      "advanced": true,
+      "help": "SynapCores graph name used for memory relations (SIMILAR_TO edges + recallRelated walks)."
+    },
+    "autoCapture": {
+      "label": "Auto-Capture",
+      "help": "Automatically capture important information from conversations"
+    },
+    "autoRecall": {
+      "label": "Auto-Recall",
+      "help": "Automatically inject relevant memories into context"
+    },
+    "autoLinkSimilar": {
+      "label": "Auto-Link Similar Memories",
+      "advanced": true,
+      "help": "On capture, draw SIMILAR_TO graph edges to existing memories with cosine similarity > 0.7 so recallRelated returns useful neighborhoods (adds ~30-50ms per capture)."
+    },
+    "workspace": {
+      "label": "Workspace ID",
+      "advanced": true,
+      "help": "Optional workspace name suffixed onto the AutoML relevance model so multiple installations sharing one gateway can train independent models."
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "embedding": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "apiKey": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string",
+            "enum": ["text-embedding-3-small", "text-embedding-3-large"]
+          }
+        },
+        "required": ["apiKey"]
+      },
+      "synapcores": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "apiKey": {
+            "type": "string"
+          },
+          "useHttps": {
+            "type": "boolean"
+          }
+        },
+        "required": ["apiKey"]
+      },
+      "collection": {
+        "type": "string"
+      },
+      "graph": {
+        "type": "string"
+      },
+      "autoCapture": {
+        "type": "boolean"
+      },
+      "autoRecall": {
+        "type": "boolean"
+      },
+      "autoLinkSimilar": {
+        "type": "boolean"
+      },
+      "workspace": {
+        "type": "string"
+      }
+    },
+    "required": ["embedding", "synapcores"]
+  }
+}
