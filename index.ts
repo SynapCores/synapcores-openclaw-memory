@@ -2,27 +2,29 @@
  * OpenClaw Memory (SynapCores) Plugin
  *
  * Long-term memory with vector search for AI conversations.
- * Uses SynapCores AIDB for storage and OpenAI for embeddings.
- * Provides seamless auto-recall and auto-capture via lifecycle hooks,
- * plus three SynapCores-only extensions (SQL-filtered recall, graph-relation
- * walks, and AutoML relevance scoring) — see `recallFiltered`,
- * `recallRelated`, and `predictRelevance`.
+ * Uses SynapCores AIDB for storage via the engine-side
+ * `MEMORY_STORE` / `MEMORY_RECALL` / `MEMORY_FORGET` primitives and
+ * OpenAI for the relevance-extension features that still need a
+ * client-side embedding (cosine feature in `predictRelevance`,
+ * graph-node embedding when `autoLinkSimilar` is on).
  *
- * This is the @synapcores/openclaw-memory drop-in alternative to
- * @openclaw/memory-lancedb. Verified end-to-end against SynapCores
- * gateway v1.6.5.2-ce. Requires @synapcores/sdk@^0.4.0 — which added
- * `client.vectorCollection(name)` + `client.createVectorCollection(...)`
- * and switched API-key auth to `Authorization: Bearer`.
+ * Provides seamless auto-recall and auto-capture via lifecycle hooks,
+ * plus four SynapCores-only extensions (SQL-filtered recall, graph-relation
+ * walks, AutoML relevance scoring, and a model-training helper) — see
+ * `recallFiltered`, `recallRelated`, `predictRelevance`, and
+ * `trainRelevanceModel`.
+ *
+ * v0.4.0 migrates the core memory ops to `@synapcores/sdk@^0.5.0`'s
+ * `client.memory` surface. Requires SynapCores gateway v1.8.5-ce+.
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { Type } from "typebox";
-import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { stringEnum } from "openclaw/plugin-sdk/core";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { SynapCores } from "@synapcores/sdk";
-import type { VectorCollection, VectorHit } from "@synapcores/sdk";
+import type { MemoryRecord } from "@synapcores/sdk";
 import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
@@ -34,6 +36,13 @@ import {
 // Types
 // ============================================================================
 
+/**
+ * Internal memory record shape used throughout the plugin. The legacy v0.3.x
+ * surface guaranteed `vector: number[]` on every entry because storage went
+ * through `client.vectorCollection(...)`. v0.4.0's `client.memory.recall`
+ * does not return embeddings — `vector` is filled lazily by callers that
+ * need it (currently only `predictRelevance` / `trainRelevanceModel`).
+ */
 export type MemoryEntry = {
   id: string;
   text: string;
@@ -54,9 +63,21 @@ export type MemorySearchResult = {
  * importance thresholds, category equality, etc.).
  */
 export type RecallFilteredOptions = {
-  /** SQL fragment applied as the search filter (e.g. `category = 'preference' AND importance >= 0.7`). */
+  /**
+   * SQL fragment applied as the search filter.
+   *
+   * v0.4.0 note: the WHERE clause is now evaluated against the columns
+   * returned by `MEMORY_RECALL(?, ?, ?)` — `id`, `content`, `similarity`,
+   * `metadata`, `created_at`. The legacy v0.3.x `category = 'preference'`
+   * shorthand still works for callers that wrote category/importance into
+   * the metadata blob (the plugin always does so) BUT the path is now
+   * engine-side JSON access: `metadata->>'category' = 'preference'` is the
+   * portable form. The plugin auto-rewrites a handful of the legacy
+   * shorthands (`category`, `importance`, `createdAt`, `text`) into the
+   * JSON-extract form so most existing callers keep working unchanged.
+   */
   where: string;
-  /** Natural-language query that gets embedded and used as the search vector. */
+  /** Natural-language query that gets embedded engine-side and used as the search vector. */
   semantic: string;
   /** Maximum results to return (default: 5). */
   limit?: number;
@@ -120,19 +141,11 @@ export type RelevanceFeedback = {
 };
 
 // ============================================================================
-// SynapCores Provider
+// Constants
 // ============================================================================
 
 const DEFAULT_COLLECTION = "openclaw_memories";
 
-/**
- * MemoryDB — thin wrapper around `@synapcores/sdk@^0.4.0`'s
- * `VectorCollection` handle. v0.2.0 dropped the direct
- * `_getHttpClient().post('/vectors/collections/...')` workaround that
- * v0.1.0 needed against SDK 0.3.x — SDK 0.4.0 ships `createVectorCollection`
- * and `vectorCollection(name)` that target `/v1/vectors/collections/...`
- * directly, so the plugin no longer has to bypass the SDK.
- */
 // ============================================================================
 // Connection preflight
 //
@@ -207,26 +220,30 @@ function classifyGatewayError(err: unknown): "connection" | "auth" | "other" {
 /**
  * One lightweight round-trip to confirm the gateway is reachable AND the API
  * key is accepted, before any memory operation runs. Throws an Error with an
- * actionable message on failure; resolves on success. Uses
- * `listVectorCollections()` (GET /v1/vectors/collections) — the same call
- * MemoryDB makes first, and a known-good CE endpoint.
+ * actionable message on failure; resolves on success.
+ *
+ * v0.4.0 uses `client.executeQuery({ sql: "SELECT 1" })` — the lowest-cost
+ * authenticated probe available on the gateway and the same path
+ * `client.memory.*` rides for every operation.
  */
 async function preflightGateway(client: SynapCores): Promise<void> {
   let host = "localhost";
   let port = 8080;
   let scheme = "http";
   try {
-    const cfg = client._getConfig();
-    host = cfg.host ?? host;
-    port = cfg.port ?? port;
-    scheme = cfg.useHttps ? "https" : "http";
+    const cfg = (client as unknown as { _getConfig?: () => { host?: string; port?: number; useHttps?: boolean } })._getConfig?.();
+    if (cfg) {
+      host = cfg.host ?? host;
+      port = cfg.port ?? port;
+      scheme = cfg.useHttps ? "https" : "http";
+    }
   } catch {
     // _getConfig is best-effort — only used to make the message specific.
   }
   const url = `${scheme}://${host}:${port}`;
 
   try {
-    await client.listVectorCollections();
+    await client.executeQuery({ sql: "SELECT 1" });
   } catch (err) {
     const kind = classifyGatewayError(err);
     if (kind === "connection") {
@@ -247,222 +264,397 @@ async function preflightGateway(client: SynapCores): Promise<void> {
   }
 }
 
+// ============================================================================
+// MemoryDB — thin wrapper around @synapcores/sdk@0.5.0's MemoryClient.
+// ============================================================================
+//
+// v0.4.0 swaps the v0.3.x `client.vectorCollection(name).insert/search/delete`
+// path for `client.memory.store/recall/forget`. The engine now owns
+// embedding (one round-trip instead of two), the table schema, and the
+// vector index — the plugin's job is to translate between OpenClaw's
+// `MemoryEntry` shape and the engine's `MemoryRecord` shape.
+//
+// HARD CUT MIGRATION: the engine-managed table is `_memory_<namespace>`,
+// which is a different storage backend from the v0.3.x vector collection.
+// Existing v0.3.x installs WILL NOT see their old memories — see the
+// README "Migration" section.
+
 class MemoryDB {
   private readonly client: SynapCores;
-  private vectorCollection: VectorCollection | null = null;
-  private initPromise: Promise<void> | null = null;
+  private preflightPromise: Promise<void> | null = null;
 
   constructor(
     client: SynapCores,
-    private readonly collectionName: string,
-    private readonly vectorDim: number,
+    private readonly namespace: string,
   ) {
     this.client = client;
   }
 
-  private async ensureInitialized(): Promise<void> {
-    if (this.vectorCollection) {
-      return;
+  /**
+   * One-time gateway preflight. Lazy — only runs on the first call,
+   * matching the v0.3.x init semantics.
+   */
+  private async ensureReady(): Promise<void> {
+    if (this.preflightPromise) {
+      return this.preflightPromise;
     }
-    if (this.initPromise) {
-      return this.initPromise;
-    }
-    this.initPromise = this.doInitialize();
-    return this.initPromise;
-  }
-
-  private async doInitialize(): Promise<void> {
-    // Fail fast with an actionable message if the gateway is down or the key
-    // is wrong, before the collection probe muddies the error.
-    await preflightGateway(this.client);
-
-    // Probe for an existing vector collection (idempotent). The SDK's
-    // `listVectorCollections()` calls GET /v1/vectors/collections and
-    // returns the bare array; we fall through to create() on any error.
-    let exists = false;
+    this.preflightPromise = preflightGateway(this.client);
     try {
-      const items = await this.client.listVectorCollections();
-      if (Array.isArray(items)) {
-        exists = items.some((it) => (it as { name?: string })?.name === this.collectionName);
-      }
-    } catch {
-      // best-effort; fall through and try to create
+      await this.preflightPromise;
+    } catch (err) {
+      // Reset on failure so the next call can retry.
+      this.preflightPromise = null;
+      throw err;
     }
-
-    if (!exists) {
-      try {
-        this.vectorCollection = await this.client.createVectorCollection({
-          name: this.collectionName,
-          dimensions: this.vectorDim,
-          distance_metric: "cosine",
-        });
-        return;
-      } catch (err) {
-        // Race with a concurrent creator — re-check before giving up.
-        try {
-          const items = await this.client.listVectorCollections();
-          if (
-            !Array.isArray(items) ||
-            !items.some((it) => (it as { name?: string })?.name === this.collectionName)
-          ) {
-            throw err;
-          }
-        } catch {
-          throw err;
-        }
-      }
-    }
-
-    // Use the synchronous accessor — no extra round-trip.
-    this.vectorCollection = this.client.vectorCollection(this.collectionName);
-  }
-
-  async store(entry: Omit<MemoryEntry, "id" | "createdAt">): Promise<MemoryEntry> {
-    await this.ensureInitialized();
-
-    const fullEntry: MemoryEntry = {
-      ...entry,
-      id: randomUUID(),
-      createdAt: Date.now(),
-    };
-
-    // v0.2.0: SDK ships VectorCollection.insert(...) which posts to
-    // /v1/vectors/collections/{name}/vectors with the {vectors: [...]}
-    // envelope automatically. v0.1.0 had a direct _getHttpClient().post()
-    // workaround here — deleted now that SDK 0.4.0 covers the wire.
-    await this.vectorCollection!.insert({
-      id: fullEntry.id,
-      values: fullEntry.vector,
-      metadata: {
-        text: fullEntry.text,
-        importance: fullEntry.importance,
-        category: fullEntry.category,
-        createdAt: fullEntry.createdAt,
-      },
-    });
-
-    return fullEntry;
-  }
-
-  async search(vector: number[], limit = 5, minScore = 0.5): Promise<MemorySearchResult[]> {
-    await this.ensureInitialized();
-    const hits = await this.vectorCollection!.search({
-      vector,
-      k: limit,
-      includeMetadata: true,
-    });
-    return hits.map(parseHitToResult).filter((r) => r.score >= minScore);
   }
 
   /**
-   * Same shape as `search`, but accepts a SQL `WHERE` clause. The SDK
-   * forwards `filter` as-is to the gateway's `/v1/vectors/collections/{n}/search`
-   * endpoint, which accepts either a JSON match object or `{ sql: "..." }`.
-   * Used by the `recallFiltered` extension method.
+   * Store a memory. `vector` on the input is IGNORED — the engine embeds
+   * `text` server-side via the configured embedding model. Returns the
+   * fully-populated entry (with engine-assigned id + timestamp).
+   */
+  async store(entry: Omit<MemoryEntry, "id" | "createdAt">): Promise<MemoryEntry> {
+    await this.ensureReady();
+    const createdAt = Date.now();
+    const id = await this.client.memory.store(this.namespace, entry.text, {
+      metadata: {
+        importance: entry.importance,
+        category: entry.category,
+        createdAt,
+      },
+    });
+    return {
+      ...entry,
+      id,
+      createdAt,
+    };
+  }
+
+  /**
+   * Semantic recall by free-text query. `minScore` is applied client-side
+   * to the engine's `similarity` field (already in [0, 1]).
+   */
+  async searchByQuery(
+    query: string,
+    limit = 5,
+    minScore = 0.5,
+  ): Promise<MemorySearchResult[]> {
+    await this.ensureReady();
+    const records = await this.client.memory.recall(this.namespace, query, {
+      topK: clampTopK(limit),
+    });
+    return records
+      .map((r) => recordToResult(r))
+      .filter((r) => r.score >= minScore);
+  }
+
+  /**
+   * SQL-filtered recall. v0.4.0 forwards the WHERE clause through to a
+   * `SELECT … FROM MEMORY_RECALL(?, ?, ?) WHERE <where>` query so the
+   * filter runs engine-side over the recall result-set.
+   *
+   * Legacy shorthand: callers wrote v0.3.x filters like
+   * `category = 'preference' AND importance >= 0.7`. v0.4.0 stores those
+   * fields inside the JSON `metadata` column, so the bare-identifier form
+   * would no longer resolve. We rewrite the four well-known shorthands
+   * (`category`, `importance`, `createdAt`, `text`) to their JSON-extract
+   * form on the way in so most existing callers keep working unchanged.
+   * Callers that already use `metadata->>'…'` get a no-op.
    */
   async searchFiltered(
-    vector: number[],
+    semantic: string,
     where: string,
     limit = 5,
   ): Promise<MemorySearchResult[]> {
-    await this.ensureInitialized();
-    const hits = await this.vectorCollection!.search({
-      vector,
-      k: limit,
-      includeMetadata: true,
-      filter: { sql: where },
-    });
-    return hits.map(parseHitToResult);
+    await this.ensureReady();
+    // Oversample so the post-filter still has enough rows to return.
+    const oversample = clampTopK(Math.max(limit * 5, 25));
+    const rewritten = rewriteLegacyWhere(where);
+    const sql =
+      "SELECT id, content, similarity, metadata, created_at " +
+      `FROM MEMORY_RECALL(?, ?, ?) WHERE ${rewritten} LIMIT ${Number(limit)}`;
+    let result;
+    try {
+      result = await this.client.executeQuery({
+        sql,
+        parameters: [this.namespace, semantic, oversample],
+      });
+    } catch (err) {
+      // Missing namespace == empty result set.
+      if (isMissingNamespaceError(err)) {
+        return [];
+      }
+      throw err;
+    }
+    return mapRecallRows(result);
   }
 
   async delete(id: string): Promise<boolean> {
-    await this.ensureInitialized();
-    // Validate UUID format to prevent injection
-    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    if (!uuidRegex.test(id)) {
-      throw new Error(`Invalid memory ID format: ${id}`);
+    await this.ensureReady();
+    if (typeof id !== "string" || id.length === 0) {
+      throw new Error(`Invalid memory ID: ${String(id)}`);
     }
-    // v0.2.0: SDK 0.4.0's VectorCollection.delete(id) hits
-    // DELETE /v1/vectors/collections/{name}/vectors/{id}.
-    await this.vectorCollection!.delete(id);
-    return true;
+    return this.client.memory.forget(this.namespace, id);
   }
 
+  /**
+   * Count memories in the namespace. The engine table is
+   * `_memory_<namespace>`; we count via a direct SQL probe. Best-effort —
+   * returns 0 if the namespace hasn't been written to yet.
+   */
   async count(): Promise<number> {
-    await this.ensureInitialized();
-    // v0.2.0: SDK 0.4.0's VectorCollection.count() probes /count first,
-    // falls back to info().vector_count. Either way, returns a number.
+    await this.ensureReady();
+    const table = `_memory_${this.namespace}`;
     try {
-      return await this.vectorCollection!.count();
-    } catch {
+      const result = await this.client.executeQuery({
+        sql: `SELECT COUNT(*) FROM ${table}`,
+      });
+      const first = result.rows?.[0];
+      const raw = Array.isArray(first) ? first[0] : undefined;
+      if (typeof raw === "number") return raw;
+      if (typeof raw === "string") {
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : 0;
+      }
+      return 0;
+    } catch (err) {
+      if (isMissingNamespaceError(err)) return 0;
       return 0;
     }
   }
 
-  /** Fetch a single memory by ID (returns null if not found). */
+  /**
+   * Fetch a single memory by id. Used by extensions (e.g.
+   * `trainRelevanceModel`) to hydrate feedback rows. Returns null if not
+   * found.
+   *
+   * Strategy: oversample MEMORY_RECALL with the id as the query string
+   * (any free text works — we only care about the id-filtered result),
+   * then look up by id. This avoids reaching into the engine-managed
+   * `_memory_<ns>` table directly.
+   */
   async get(id: string): Promise<MemoryEntry | null> {
-    await this.ensureInitialized();
-    // v0.2.0: SDK 0.4.0's VectorCollection.get(id) returns
-    // { id, values, metadata } | null. v0.1.0 had a direct
-    // _getHttpClient().get() workaround here — deleted.
-    let hit: VectorHit | null = null;
+    await this.ensureReady();
+    if (typeof id !== "string" || id.length === 0) return null;
     try {
-      hit = await this.vectorCollection!.get(id);
+      const result = await this.client.executeQuery({
+        sql:
+          "SELECT id, content, similarity, metadata, created_at " +
+          "FROM MEMORY_RECALL(?, ?, ?) WHERE id = ? LIMIT 1",
+        parameters: [this.namespace, " ", 100, id],
+      });
+      const mapped = mapRecallRows(result);
+      if (mapped.length === 0) return null;
+      return mapped[0].entry;
     } catch (err) {
-      const e = err as { code?: string; status?: number };
-      if (e?.code === "NOT_FOUND" || e?.status === 404) return null;
+      if (isMissingNamespaceError(err)) return null;
       throw err;
     }
-    if (!hit) return null;
-    const meta = (hit.metadata as Record<string, unknown> | undefined) ?? {};
-    return {
-      id: String(hit.id ?? id),
-      text: typeof meta.text === "string" ? meta.text : "",
-      vector: Array.isArray(hit.values) ? (hit.values as number[]) : [],
-      importance: typeof meta.importance === "number" ? (meta.importance as number) : 0,
-      category: (meta.category as MemoryCategory) ?? "other",
-      createdAt: typeof meta.createdAt === "number" ? (meta.createdAt as number) : 0,
-    };
+  }
+
+  /** Expose the namespace (used by recallRelated for graph queries). */
+  get ns(): string {
+    return this.namespace;
   }
 }
 
-function hitToEntry(hit: Record<string, unknown>): MemoryEntry {
-  // SDK 0.4.0 VectorCollection.search returns the gateway's hit shape:
-  //   { id, score, values?, metadata: { text, importance, category, createdAt } }
-  const meta = (hit.metadata as Record<string, unknown> | undefined) ?? {};
-  const text = typeof meta.text === "string" ? (meta.text as string) : "";
-  const importance = typeof meta.importance === "number" ? (meta.importance as number) : 0;
-  const category = (meta.category as MemoryCategory) ?? "other";
-  const createdAt = typeof meta.createdAt === "number" ? (meta.createdAt as number) : 0;
-  const vector = Array.isArray(hit.values) ? (hit.values as number[]) : [];
+// ============================================================================
+// Shape translators between engine MemoryRecord and plugin MemoryEntry
+// ============================================================================
+
+function clampTopK(k: number): number {
+  if (!Number.isFinite(k) || k < 1) return 1;
+  if (k > 100) return 100;
+  return Math.floor(k);
+}
+
+function metadataField(
+  metadata: Record<string, unknown> | null | undefined,
+  key: string,
+): unknown {
+  if (!metadata) return undefined;
+  return metadata[key];
+}
+
+function recordToEntry(record: MemoryRecord): MemoryEntry {
+  const meta = record.metadata ?? null;
+  const importance = metadataField(meta, "importance");
+  const category = metadataField(meta, "category");
+  const createdAtMeta = metadataField(meta, "createdAt");
+  const createdAtTs = record.createdAt instanceof Date
+    ? record.createdAt.getTime()
+    : Number.NaN;
   return {
-    id: String(hit.id ?? ""),
-    text,
-    vector,
-    importance,
-    category,
-    createdAt,
+    id: record.id,
+    text: record.content,
+    vector: [],
+    importance: typeof importance === "number" ? importance : 0,
+    category: (typeof category === "string"
+      ? (category as MemoryCategory)
+      : "other") as MemoryCategory,
+    createdAt: typeof createdAtMeta === "number"
+      ? createdAtMeta
+      : Number.isFinite(createdAtTs)
+        ? createdAtTs
+        : 0,
   };
 }
 
-function parseHitToResult(hit: Record<string, unknown>): MemorySearchResult {
-  // Gateway v1.6.5.2-ce returns cosine **distance** as `score` (lower =
-  // closer; 0 = identical, 1 = orthogonal, 2 = opposite). Convert to a
-  // [0, 1] similarity for the public API. If a separate `distance` field
-  // ever appears we honour it for parity.
-  const rawScore = typeof hit.score === "number" ? (hit.score as number) : undefined;
-  const rawDistance = typeof hit.distance === "number" ? (hit.distance as number) : undefined;
-  const distance = rawDistance ?? rawScore ?? 0;
-  const similarity = Math.max(0, Math.min(1, 1 - distance));
+function recordToResult(record: MemoryRecord): MemorySearchResult {
   return {
-    entry: hitToEntry(hit),
-    score: similarity,
+    entry: recordToEntry(record),
+    score: clamp01(record.similarity),
   };
+}
+
+/**
+ * Parse a raw `executeQuery` result-set into MemorySearchResult[].
+ * Mirrors @synapcores/sdk@0.5.0's MemoryClient row mapping but operates
+ * on `executeQuery` output (which is what we use here for the WHERE-clause
+ * pass-through).
+ */
+function mapRecallRows(result: {
+  columns?: Array<{ name?: string } | string>;
+  rows?: unknown[][];
+}): MemorySearchResult[] {
+  const cols = (result.columns ?? []).map((c) =>
+    typeof c === "string" ? c : (c?.name ?? ""),
+  );
+  const colIndex = (name: string): number => cols.findIndex((c) => c === name);
+  const idIdx = colIndex("id");
+  const contentIdx = colIndex("content");
+  const simIdx = colIndex("similarity");
+  const metaIdx = colIndex("metadata");
+  const createdIdx = colIndex("created_at");
+
+  const rows = result.rows ?? [];
+  const out: MemorySearchResult[] = [];
+  for (const row of rows) {
+    if (!Array.isArray(row)) continue;
+    const meta = parseMetadataValue(metaIdx >= 0 ? row[metaIdx] : undefined);
+    const createdRaw = createdIdx >= 0 ? row[createdIdx] : undefined;
+    const createdAtMs = parseTimestampMs(createdRaw);
+    const importance = metadataField(meta, "importance");
+    const category = metadataField(meta, "category");
+    const similarity = simIdx >= 0 ? toFiniteNumber(row[simIdx]) : 0;
+    const id = idIdx >= 0 ? String(row[idIdx] ?? "") : "";
+    const content = contentIdx >= 0 ? String(row[contentIdx] ?? "") : "";
+    out.push({
+      entry: {
+        id,
+        text: content,
+        vector: [],
+        importance: typeof importance === "number" ? importance : 0,
+        category: (typeof category === "string"
+          ? (category as MemoryCategory)
+          : "other") as MemoryCategory,
+        createdAt: typeof metadataField(meta, "createdAt") === "number"
+          ? (metadataField(meta, "createdAt") as number)
+          : createdAtMs,
+      },
+      score: clamp01(similarity),
+    });
+  }
+  return out;
+}
+
+function parseMetadataValue(value: unknown): Record<string, unknown> | null {
+  if (value == null || value === "") return null;
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // fall through
+    }
+  }
+  return null;
+}
+
+function parseTimestampMs(value: unknown): number {
+  if (typeof value === "number") {
+    return value;
+  }
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  if (typeof value === "string" && value.length > 0) {
+    const candidate = value.includes("T") ? value : value.replace(" ", "T");
+    const d = new Date(candidate);
+    const t = d.getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  return 0;
+}
+
+function toFiniteNumber(value: unknown): number {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  if (typeof value === "string") {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+function isMissingNamespaceError(err: unknown): boolean {
+  const e = err as { code?: string; message?: string };
+  if (e?.code === "NOT_FOUND") return true;
+  const msg = String(e?.message ?? "").toLowerCase();
+  return (
+    msg.includes("does not exist") ||
+    msg.includes("no such table") ||
+    msg.includes("unknown namespace") ||
+    msg.includes("namespace not found")
+  );
+}
+
+/**
+ * Rewrite a handful of legacy column-name shorthands into the JSON-extract
+ * form expected against `MEMORY_RECALL`'s output schema. This is best-
+ * effort and intentionally limited — callers writing complex SQL should
+ * use the engine-native syntax directly.
+ *
+ * Rewrites:
+ *   category    -> metadata->>'category'
+ *   importance  -> CAST(metadata->>'importance' AS REAL)
+ *   createdAt   -> CAST(metadata->>'createdAt' AS INTEGER)
+ *   text        -> content
+ *
+ * Identifiers preceded by a dot (e.g. `m.category`) or wrapped in quotes
+ * are left untouched.
+ */
+function rewriteLegacyWhere(where: string): string {
+  const rules: Array<[RegExp, string]> = [
+    [/(?<![.'"\w])category(?![\w])/g, "metadata->>'category'"],
+    [/(?<![.'"\w])importance(?![\w])/g, "CAST(metadata->>'importance' AS REAL)"],
+    [/(?<![.'"\w])createdAt(?![\w])/g, "CAST(metadata->>'createdAt' AS INTEGER)"],
+    [/(?<![.'"\w])text(?![\w])/g, "content"],
+  ];
+  let out = where;
+  for (const [re, repl] of rules) {
+    out = out.replace(re, repl);
+  }
+  return out;
 }
 
 // ============================================================================
 // OpenAI Embeddings
 // ============================================================================
+//
+// v0.4.0 NOTE: the engine now owns embedding for the core memory ops
+// (`MEMORY_STORE` / `MEMORY_RECALL`). OpenAI is still used by:
+//   - `predictRelevance` / `trainRelevanceModel`: client-side cosine
+//     between query and candidate text.
+//   - `autoLinkSimilar` capture: writing an `embedding` property onto the
+//     Memory graph node so `recallRelated`'s synthetic SIMILAR_TO edge
+//     resolves at MATCH time.
+// Callers that never use the relevance extensions and disable
+// `autoLinkSimilar` will not hit the OpenAI client.
 
 class Embeddings {
   private client: OpenAI;
@@ -622,11 +814,12 @@ function detectCategory(text: string): MemoryCategory {
 /**
  * Escape a string literal for safe inlining into a Cypher query.
  *
- * Gateway v1.6.5.2-ce explicitly rejects named-parameter bindings (`$param`)
- * with HTTP 400; the supported path is to inline literal values into the
- * query string. Memory IDs flow in from `randomUUID()` so they are normally
- * safe, BUT we never trust upstream input — every string that ends up
- * inside `'...'` in a Cypher fragment must go through this helper.
+ * Gateway v1.6.5.2+ rejects named-parameter bindings (`$param`) with HTTP
+ * 400; the supported path is to inline literal values into the query
+ * string. Memory IDs flow in from `MEMORY_STORE` (engine-generated, e.g.
+ * `mem_1kv69sxfn_5ofzwK`) so they are normally safe, BUT we never trust
+ * upstream input — every string that ends up inside `'...'` in a Cypher
+ * fragment must go through this helper.
  *
  * Escapes single quotes (`'` -> `\'`) and backslashes (`\` -> `\\`).
  * Returns the inner content only; callers are responsible for the
@@ -649,55 +842,53 @@ const MAX_HOPS = 4;
 const DEFAULT_RECALL_RELATED_LIMIT = 20;
 
 /**
- * `linkSimilarMemories` — capture-time graph wiring (v0.2.0).
+ * `linkSimilarMemories` — capture-time graph wiring.
  *
- * v0.1.0 was a no-op: it tried to write explicit `SIMILAR_TO` edges via
- * Cypher `MERGE`, which gateway v1.6.5.x rejects because SIMILAR_TO is a
- * synthetic / derived edge type computed from the graph backend's vector
- * index at MATCH time.
- *
- * v0.2.0 takes the supported path instead: insert the Memory as a graph
- * node carrying the embedding under the property name `embedding` — the
- * field the gateway's brute-force vector index is wired against (see
+ * Inserts the Memory as a graph node carrying the OpenAI embedding under
+ * the property name `embedding` — the field the gateway's brute-force
+ * vector index is wired against (see
  * `aidb_gateway::routes::graph::attach_default_vector_index`). Once a
  * Memory node exists, `recallRelated` can MATCH `[:SIMILAR_TO > T]`
  * against it and get neighbors back without any pre-stored edges.
  *
+ * v0.4.0 NOTE: the engine no longer exposes the vector it used internally
+ * for `MEMORY_STORE`, so this helper still embeds the text via the
+ * OpenAI client. The two embeddings (engine + OpenAI) need not match;
+ * each is independent and serves a different recall path.
+ *
  * Failures here are non-fatal — the capture itself still succeeded in the
- * vector subsystem; we just log and move on so recall continues to work.
+ * memory subsystem; we just log and move on so the rest of recall keeps
+ * working.
  */
 async function linkSimilarMemories(
   entry: MemoryEntry,
-  _db: MemoryDB,
   client: SynapCores,
-  _graphName: string,
+  embedVector: number[],
   logger: { warn?: (msg: string) => void } | undefined,
 ): Promise<number> {
   try {
-    // Insert a Memory node with the embedding so the synthetic
-    // SIMILAR_TO edge in `recallRelated` has something to match against.
-    // The `id` property mirrors the vector-collection id so callers can
-    // join the two views.
-    //
-    // KNOWN SDK GAP (@synapcores/sdk@0.4.0):
+    // KNOWN SDK GAP (@synapcores/sdk@<=0.5.0):
     //   `client.graph.nodes.create(label, props)` posts
     //   `{label: <single>, properties}` but the gateway's
     //   /v1/graph/nodes handler expects `{labels: <array>, properties}`
     //   (see aidb_gateway::routes::graph::CreateNodeRequest). The result
     //   is a node with `labels: []`, which never matches the `Memory`
     //   label filter in MATCH. We bypass the SDK helper for THIS one
-    //   call and post the correct wire shape ourselves. Once SDK >0.4.0
-    //   fixes `GraphNodeApi.create` to send `labels`, this `_getHttpClient`
-    //   call can be replaced with `client.graph.nodes.create(...)`.
+    //   call and post the correct wire shape ourselves. Once the SDK
+    //   fixes `GraphNodeApi.create` to send `labels`, this
+    //   `_getHttpClient` call can be replaced with
+    //   `client.graph.nodes.create(...)`.
     const http = (
-      client as unknown as { _getHttpClient: () => { post: (p: string, b: unknown) => Promise<unknown> } }
+      client as unknown as {
+        _getHttpClient: () => { post: (p: string, b: unknown) => Promise<unknown> };
+      }
     )._getHttpClient();
     await http.post("/graph/nodes", {
       labels: ["Memory"],
       properties: {
         id: entry.id,
         text: entry.text,
-        embedding: entry.vector,
+        embedding: embedVector,
         importance: entry.importance,
         category: entry.category,
         createdAt: entry.createdAt,
@@ -714,7 +905,7 @@ async function linkSimilarMemories(
 }
 
 // ============================================================================
-// AutoML helpers — staged-collection training (v0.2.0)
+// AutoML helpers — staged-collection training
 // ============================================================================
 
 const DEFAULT_RELEVANCE_MODEL = "openclaw_memory_relevance";
@@ -743,9 +934,8 @@ function trainingTableName(workspace?: string): string {
  * them through the OpenClaw plugin registry.
  *
  * The four SynapCores-only methods use:
- *   - `vectorCollection.search({ ..., filter: { sql } })` for `recallFiltered`,
- *     forwarding the SQL `WHERE` clause to the gateway under
- *     `filter: { sql: where }`.
+ *   - `client.executeQuery(...)` against MEMORY_RECALL for `recallFiltered`,
+ *     wrapping the user's WHERE clause around the engine's recall result-set.
  *   - `client.graph.cypher(...)` for `recallRelated`, walking the synthetic
  *     `SIMILAR_TO` edges that resolve against `Memory.embedding`.
  *   - `client.automl.getModel(...).predict(...)` for `predictRelevance`, with
@@ -760,7 +950,7 @@ export interface MemorySynapCoresExtensions {
    *
    * @example
    *   await ext.recallFiltered({
-   *     where: "category = 'preference' AND importance >= 0.7 AND createdAt > 1700000000000",
+   *     where: "category = 'preference' AND importance >= 0.7",
    *     semantic: "what kind of UI does the user prefer?",
    *     limit: 5,
    *   });
@@ -771,13 +961,13 @@ export interface MemorySynapCoresExtensions {
    * Graph walk from a memory through `SIMILAR_TO` / `MENTIONS` / `RELATES_TO`
    * edges, returning the neighborhood.
    *
-   * v0.2.0 wires this against the gateway's synthetic-SIMILAR_TO Cypher
-   * syntax (`[:SIMILAR_TO > T]`) which resolves against the `embedding`
-   * property the plugin writes onto every captured Memory node. If a
-   * source memory has not been promoted to a graph node yet (e.g.
-   * `autoLinkSimilar: false`), this returns an empty array.
+   * Wires against the gateway's synthetic-SIMILAR_TO Cypher syntax
+   * (`[:SIMILAR_TO > T]`) which resolves against the `embedding` property
+   * the plugin writes onto every captured Memory node. If a source memory
+   * has not been promoted to a graph node yet (e.g. `autoLinkSimilar:
+   * false`), this returns an empty array.
    *
-   * @param memoryId - UUID of the source memory.
+   * @param memoryId - id of the source memory (engine-assigned, e.g. `mem_...`).
    * @param options - Hops, edge-kind filter, similarity threshold, limit.
    */
   recallRelated(memoryId: string, options?: RecallRelatedOptions): Promise<RelatedMemoryResult[]>;
@@ -807,12 +997,12 @@ export interface MemorySynapCoresExtensions {
   /**
    * Train (or retrain) the AutoML model used by `predictRelevance`.
    *
-   * v0.2.0 wires this against the staged-collection workflow: feedback
-   * rows are inserted into a SQL table the gateway's AutoML can read
-   * via `SELECT * FROM {table}`, then `/v1/automl/train` is invoked with
+   * Wires against the staged-collection workflow: feedback rows are
+   * inserted into a SQL table the gateway's AutoML can read via
+   * `SELECT * FROM {table}`, then `/v1/automl/train` is invoked with
    * `target: 'score'` to fit a regression model. Existing training data
-   * in the staging table is preserved across calls so feedback
-   * accumulates across sessions.
+   * in the staging table is preserved across calls so feedback accumulates
+   * across sessions.
    *
    * @param feedback - Array of `{ memoryId, queryText, score }` samples.
    *                   Requires at least {@link MIN_TRAINING_SAMPLES} samples;
@@ -822,13 +1012,27 @@ export interface MemorySynapCoresExtensions {
   trainRelevanceModel(feedback: RelevanceFeedback[]): Promise<{ modelId: string; modelName: string }>;
 }
 
+async function ensureCandidateVector(
+  candidate: MemoryEntry,
+  embeddings: Embeddings,
+): Promise<number[]> {
+  if (Array.isArray(candidate.vector) && candidate.vector.length > 0) {
+    return candidate.vector;
+  }
+  if (!candidate.text) return [];
+  try {
+    return await embeddings.embed(candidate.text);
+  } catch {
+    return [];
+  }
+}
+
 function createExtensions(
   db: MemoryDB,
   embeddings: Embeddings,
   client: SynapCores,
   _graphName: string,
   workspace?: string,
-  _collectionName: string = DEFAULT_COLLECTION,
 ): MemorySynapCoresExtensions {
   const modelName = relevanceModelName(workspace);
   const stagingTable = trainingTableName(workspace);
@@ -845,23 +1049,20 @@ function createExtensions(
   return {
     async recallFiltered(options: RecallFilteredOptions): Promise<MemorySearchResult[]> {
       const limit = options.limit ?? 5;
-      const vector = await embeddings.embed(options.semantic);
-      return db.searchFiltered(vector, options.where, limit);
+      return db.searchFiltered(options.semantic, options.where, limit);
     },
 
     async recallRelated(
       memoryId: string,
       options: RecallRelatedOptions = {},
     ): Promise<RelatedMemoryResult[]> {
-      // v0.2.0 implementation:
-      //
-      // Gateway v1.6.5.x derives `SIMILAR_TO` synthetically at MATCH
-      // time from the graph backend's vector index on the `embedding`
-      // property. `linkSimilarMemories` populates that index on every
-      // capture by posting a `Memory` graph node carrying the embedding.
-      // With nodes in place, this method composes a Cypher MATCH that
-      // walks SIMILAR_TO (plus any non-synthetic edges the caller named
-      // via `edgeKinds`) and returns the neighborhood.
+      // The gateway derives `SIMILAR_TO` synthetically at MATCH time from
+      // the graph backend's vector index on the `embedding` property.
+      // `linkSimilarMemories` populates that index on every capture by
+      // posting a `Memory` graph node carrying the embedding. With nodes
+      // in place, this method composes a Cypher MATCH that walks
+      // SIMILAR_TO (plus any non-synthetic edges the caller named via
+      // `edgeKinds`) and returns the neighborhood.
       //
       // Wire constraints:
       //  - Multi-hop `[:SIMILAR_TO*1..N]` is rejected — SIMILAR_TO is
@@ -896,9 +1097,27 @@ function createExtensions(
           cypher = `MATCH (start:Memory {id: '${id}'})-[:${safeKind}*1..${hops}]-(related:Memory) RETURN DISTINCT related LIMIT ${limit}`;
         }
 
-        let result: { rows?: unknown[][]; records?: Array<Record<string, unknown>> };
+        let result: { columns?: string[]; rows?: unknown[][]; records?: Array<Record<string, unknown>> };
         try {
-          result = await client.graph.cypher(cypher);
+          // SDK 0.5.0 no longer exposes `client.graph.cypher` — the
+          // canonical path is `POST /v1/graph/match` with `{sql: <cypher>}`.
+          // We reach through the SDK's underlying axios instance via
+          // `_getHttpClient()`, the same accessor `linkSimilarMemories`
+          // uses for the `/graph/nodes` workaround.
+          const http = (
+            client as unknown as {
+              _getHttpClient: () => {
+                post: (p: string, b: unknown) => Promise<{ data: unknown }>;
+              };
+            }
+          )._getHttpClient();
+          const response = await http.post("/graph/match", { sql: cypher });
+          const body = (response?.data ?? {}) as {
+            columns?: string[];
+            rows?: unknown[][];
+            records?: Array<Record<string, unknown>>;
+          };
+          result = body;
         } catch (err) {
           const msg = (err as { message?: string })?.message ?? String(err);
           throw new Error(
@@ -906,10 +1125,24 @@ function createExtensions(
           );
         }
 
-        // The SDK normalises responses to { columns, rows, records }.
-        // Prefer `records` (column-keyed) and fall back to `rows`.
+        // Gateway returns `{ columns, rows, count }`. Older SDK shims
+        // also emitted `records` (column-keyed objects); we honour both.
         const records = Array.isArray(result?.records) ? result!.records! : [];
-        const rows = Array.isArray(result?.rows) ? result!.rows! : [];
+        const cols = Array.isArray(result?.columns) ? result!.columns! : [];
+        const rawRows = Array.isArray(result?.rows) ? result!.rows! : [];
+        // Synthesize `records` from `(columns, rows)` if not provided.
+        const synthRecords: Array<Record<string, unknown>> = records.length > 0
+          ? records
+          : rawRows
+              .filter((r) => Array.isArray(r))
+              .map((r) => {
+                const obj: Record<string, unknown> = {};
+                for (let i = 0; i < cols.length; i++) {
+                  obj[cols[i]] = (r as unknown[])[i];
+                }
+                return obj;
+              });
+        const rows = rawRows;
 
         const harvest = (node: unknown): void => {
           if (!node || typeof node !== "object") return;
@@ -935,7 +1168,7 @@ function createExtensions(
           });
         };
 
-        for (const rec of records) {
+        for (const rec of synthRecords) {
           // records: { related: <node> }
           harvest((rec as Record<string, unknown>)?.related ?? Object.values(rec ?? {})[0]);
         }
@@ -957,7 +1190,15 @@ function createExtensions(
       if (candidates.length === 0) return [];
       const queryVector = await embeddings.embed(query);
       const now = Date.now();
-      const features = candidates.map((c) => buildRelevanceFeatures(queryVector, c, now));
+      // v0.4.0: MEMORY_RECALL doesn't return embeddings, so candidates
+      // surfaced via the core recall path arrive with `vector: []`. We
+      // lazily embed the candidate text when we need a cosine feature.
+      const candidateVectors = await Promise.all(
+        candidates.map((c) => ensureCandidateVector(c, embeddings)),
+      );
+      const features = candidates.map((c, i) =>
+        buildRelevanceFeatures(queryVector, { ...c, vector: candidateVectors[i] }, now),
+      );
 
       // Try model mode; on any failure (no model, transport error) fall
       // back to the heuristic so the caller never gets an empty result.
@@ -997,11 +1238,9 @@ function createExtensions(
         );
       }
 
-      // v0.2.0 implementation: stage rows in a SQL table the gateway's
-      // AutoML can `SELECT * FROM`. Gateway v1.6.5.2-ce rejects
-      // `config.inline_rows` (the workflow v0.1.0 attempted) and
-      // requires the data to land in a real collection/table before
-      // training. We:
+      // Stage rows in a SQL table the gateway's AutoML can `SELECT * FROM`.
+      // The gateway requires the data to land in a real collection/table
+      // before training. We:
       //   1. Hydrate each feedback row's memory into a full feature
       //      vector (cosine, age_days, importance, one-hot category) via
       //      the same `buildRelevanceFeatures` helper `predictRelevance`
@@ -1015,7 +1254,8 @@ function createExtensions(
       // proceeds with the remainder.
 
       // Hydrate feedback rows. Embed each query text once; pair with
-      // the stored Memory's vector to get the cosine feature.
+      // the stored Memory's content (re-embedded via OpenAI) to get the
+      // cosine feature.
       const hydrated: Array<{
         cosine: number;
         age_days: number;
@@ -1034,8 +1274,9 @@ function createExtensions(
           missing++;
           continue;
         }
+        const memVector = await ensureCandidateVector(mem, embeddings);
         const queryVec = await embeddings.embed(fb.queryText);
-        const feats = buildRelevanceFeatures(queryVec, mem);
+        const feats = buildRelevanceFeatures(queryVec, { ...mem, vector: memVector });
         hydrated.push({
           cosine: feats.asRecord.cosine,
           age_days: feats.asRecord.age_days,
@@ -1161,20 +1402,28 @@ const memoryPlugin = {
 
   register(api: OpenClawPluginApi) {
     const cfg = memoryConfigSchema.parse(api.pluginConfig);
-    const vectorDim = vectorDimsForModel(cfg.embedding.model ?? "text-embedding-3-small");
-    const collectionName = cfg.collection ?? DEFAULT_COLLECTION;
+    // Validate `vectorDimsForModel` runs without throwing; the dimension
+    // value itself isn't used in v0.4.0 because the engine owns embedding
+    // for the core memory ops.
+    vectorDimsForModel(cfg.embedding.model ?? "text-embedding-3-small");
+    const namespace = cfg.collection ?? DEFAULT_COLLECTION;
+    // The new MemoryClient enforces namespace ^[A-Za-z_][A-Za-z0-9_]*$. Fail
+    // loud and early if the OpenClaw config's `collection` value would be
+    // rejected.
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(namespace)) {
+      throw new Error(
+        `memory-synapcores: collection '${namespace}' is not a valid namespace ` +
+          `(must match /^[A-Za-z_][A-Za-z0-9_]*$/). Update plugins.entries.memory-synapcores.config.collection.`,
+      );
+    }
 
-    // v0.2.0: pass apiKey straight through. @synapcores/sdk@0.4.0
-    // routes both apiKey AND jwtToken via `Authorization: Bearer`, so
-    // the v0.1.0 shim that re-routed `aidb_*` / `ak_*` keys through
-    // `jwtToken` to coerce the right header is gone.
     const client = new SynapCores({
       host: cfg.synapcores.host,
       port: cfg.synapcores.port,
       useHttps: cfg.synapcores.useHttps,
       apiKey: cfg.synapcores.apiKey,
     });
-    const db = new MemoryDB(client, collectionName, vectorDim);
+    const db = new MemoryDB(client, namespace);
     const embeddings = new Embeddings(cfg.embedding.apiKey, cfg.embedding.model!);
     const extensions = createExtensions(
       db,
@@ -1182,13 +1431,11 @@ const memoryPlugin = {
       client,
       cfg.graph!,
       cfg.workspace,
-      collectionName,
     );
     const autoLinkSimilar = cfg.autoLinkSimilar !== false;
-    const graphName = cfg.graph!;
 
     api.logger.info(
-      `memory-synapcores: plugin registered (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, collection: ${collectionName}, autoLinkSimilar: ${autoLinkSimilar}, lazy init)`,
+      `memory-synapcores: plugin registered (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, namespace: ${namespace}, autoLinkSimilar: ${autoLinkSimilar}, lazy init)`,
     );
 
     // ========================================================================
@@ -1208,8 +1455,7 @@ const memoryPlugin = {
         async execute(_toolCallId, params) {
           const { query, limit = 5 } = params as { query: string; limit?: number };
 
-          const vector = await embeddings.embed(query);
-          const results = await db.search(vector, limit, 0.1);
+          const results = await db.searchByQuery(query, limit, 0.1);
 
           if (results.length === 0) {
             return {
@@ -1225,7 +1471,6 @@ const memoryPlugin = {
             )
             .join("\n");
 
-          // Strip vector data for serialization (typed arrays can't be cloned)
           const sanitizedResults = results.map((r) => ({
             id: r.entry.id,
             text: r.entry.text,
@@ -1265,10 +1510,9 @@ const memoryPlugin = {
             category?: MemoryEntry["category"];
           };
 
-          const vector = await embeddings.embed(text);
-
-          // Check for duplicates
-          const existing = await db.search(vector, 1, 0.95);
+          // Check for duplicates via the engine's recall path. The engine
+          // re-embeds `text` internally so we don't have to.
+          const existing = await db.searchByQuery(text, 1, 0.95);
           if (existing.length > 0) {
             return {
               content: [
@@ -1287,16 +1531,23 @@ const memoryPlugin = {
 
           const entry = await db.store({
             text,
-            vector,
+            vector: [],
             importance,
             category,
           });
 
-          // v0.2.0: linkSimilarMemories now inserts a Memory graph node
-          // carrying the embedding so recallRelated has something to
-          // MATCH against. Failures are non-fatal (logged in-helper).
+          // linkSimilarMemories inserts a Memory graph node carrying an
+          // OpenAI-embedded representation so recallRelated has something
+          // to MATCH against. Failures are non-fatal (logged in-helper).
           if (autoLinkSimilar) {
-            await linkSimilarMemories(entry, db, client, graphName, api.logger);
+            try {
+              const embedVec = await embeddings.embed(text);
+              await linkSimilarMemories(entry, client, embedVec, api.logger);
+            } catch (err) {
+              api.logger.warn(
+                `memory-synapcores: graph-node embed failed for ${entry.id}: ${String(err)} (capture still succeeded)`,
+              );
+            }
           }
 
           return {
@@ -1329,8 +1580,7 @@ const memoryPlugin = {
           }
 
           if (query) {
-            const vector = await embeddings.embed(query);
-            const results = await db.search(vector, 5, 0.7);
+            const results = await db.searchByQuery(query, 5, 0.7);
 
             if (results.length === 0) {
               return {
@@ -1351,7 +1601,6 @@ const memoryPlugin = {
               .map((r) => `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}...`)
               .join("\n");
 
-            // Strip vector data for serialization
             const sanitizedCandidates = results.map((r) => ({
               id: r.entry.id,
               text: r.entry.text,
@@ -1401,9 +1650,7 @@ const memoryPlugin = {
           .argument("<query>", "Search query")
           .option("--limit <n>", "Max results", "5")
           .action(async (query, opts) => {
-            const vector = await embeddings.embed(query);
-            const results = await db.search(vector, parseInt(opts.limit), 0.3);
-            // Strip vectors for output
+            const results = await db.searchByQuery(query, parseInt(opts.limit), 0.3);
             const output = results.map((r) => ({
               id: r.entry.id,
               text: r.entry.text,
@@ -1437,8 +1684,7 @@ const memoryPlugin = {
         }
 
         try {
-          const vector = await embeddings.embed(event.prompt);
-          const results = await db.search(vector, 3, 0.3);
+          const results = await db.searchByQuery(event.prompt, 3, 0.3);
 
           if (results.length === 0) {
             return;
@@ -1470,13 +1716,11 @@ const memoryPlugin = {
           // Extract text content from messages (handling unknown[] type)
           const texts: string[] = [];
           for (const msg of event.messages) {
-            // Type guard for message object
             if (!msg || typeof msg !== "object") {
               continue;
             }
             const msgObj = msg as Record<string, unknown>;
 
-            // Only process user and assistant messages
             const role = msgObj.role;
             if (role !== "user" && role !== "assistant") {
               continue;
@@ -1484,13 +1728,11 @@ const memoryPlugin = {
 
             const content = msgObj.content;
 
-            // Handle string content directly
             if (typeof content === "string") {
               texts.push(content);
               continue;
             }
 
-            // Handle array content (content blocks)
             if (Array.isArray(content)) {
               for (const block of content) {
                 if (
@@ -1517,22 +1759,28 @@ const memoryPlugin = {
           let stored = 0;
           for (const text of toCapture.slice(0, 3)) {
             const category = detectCategory(text);
-            const vector = await embeddings.embed(text);
 
             // Check for duplicates (high similarity threshold)
-            const existing = await db.search(vector, 1, 0.95);
+            const existing = await db.searchByQuery(text, 1, 0.95);
             if (existing.length > 0) {
               continue;
             }
 
             const entry = await db.store({
               text,
-              vector,
+              vector: [],
               importance: 0.7,
               category,
             });
             if (autoLinkSimilar) {
-              await linkSimilarMemories(entry, db, client, graphName, api.logger);
+              try {
+                const embedVec = await embeddings.embed(text);
+                await linkSimilarMemories(entry, client, embedVec, api.logger);
+              } catch (err) {
+                api.logger.warn(
+                  `memory-synapcores: graph-node embed failed for ${entry.id}: ${String(err)}`,
+                );
+              }
             }
             stored++;
           }
@@ -1559,7 +1807,7 @@ const memoryPlugin = {
         try {
           await preflightGateway(client);
           api.logger.info(
-            `memory-synapcores: initialized (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, collection: ${collectionName}, model: ${cfg.embedding.model})`,
+            `memory-synapcores: initialized (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, namespace: ${namespace}, model: ${cfg.embedding.model})`,
           );
         } catch (err) {
           api.logger.warn(`memory-synapcores: ${String((err as Error)?.message ?? err)}`);

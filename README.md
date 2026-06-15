@@ -1,12 +1,26 @@
 # @synapcores/openclaw-memory
 
-A long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) that uses **SynapCores AIDB** as the storage backend. Drop-in alternative to `@openclaw/memory-lancedb` with the same auto-recall / auto-capture lifecycle, plus three SynapCores-only extensions: SQL-filtered semantic recall, graph-relation walks, and AutoML relevance scoring.
+A long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) that uses **SynapCores AIDB** as the storage backend. Drop-in alternative to `@openclaw/memory-lancedb` with the same auto-recall / auto-capture lifecycle, plus four SynapCores-only extensions: SQL-filtered semantic recall, graph-relation walks, AutoML relevance scoring, and a model-training helper.
 
-> **0.2.0 shipping note:** verified against gateway `v1.6.5.2-ce` and `@synapcores/sdk@^0.4.0`. The full surface — parity API (recall/capture/forget) **plus all four SynapCores-only extensions** (`recallFiltered`, `recallRelated`, `predictRelevance`, `trainRelevanceModel`) — is wired against the live SDK and exercised end-to-end (7/7 live smoke steps pass against `:28201`).
+> **0.4.0 shipping note:** the core memory ops (`memory_store` / `memory_recall` / `memory_forget`) now ride the engine-side `MEMORY_STORE` / `MEMORY_RECALL` / `MEMORY_FORGET` primitives via `@synapcores/sdk@^0.5.0`'s `client.memory` surface. The plugin's public API (tools, CLI, extensions, types) is unchanged — only the internal storage path moved.
 >
-> - **`recallRelated`** is now implemented (was signature-only in 0.1.0). On capture, the plugin inserts each Memory as a graph node carrying the embedding under the `embedding` property so the gateway's synthetic `SIMILAR_TO` edge resolves at MATCH time. `autoLinkSimilar: true` (default) enables this; turn it off if you don't need graph-backed recall.
-> - **`trainRelevanceModel`** is now implemented (was signature-only in 0.1.0). Feedback rows are staged in a SQL table (`openclaw_memory_relevance_training[_<workspace>]`) the gateway's AutoML can read, then trained as a regression model targeting the `score` column.
-> - SDK dep bumped to `@synapcores/sdk@^0.4.0` (which switched API-key auth to `Authorization: Bearer` and added `createVectorCollection` / `vectorCollection(name)`). The three v0.1.0 workarounds — auth-header shim, direct `/v1/vectors/collections` POSTs, direct `/v1/vectors/collections/{n}/vectors` POSTs — are deleted in favour of the SDK's typed helpers.
+> - **Requires SynapCores gateway `v1.8.5-ce` or newer** (the version that ships the `MEMORY_*` SQL functions).
+> - **Embedding moved server-side for the hot path.** `memory_store` / `memory_recall` no longer call OpenAI — the gateway embeds via its configured model. The OpenAI client is still used by the relevance extensions (`predictRelevance`, `trainRelevanceModel`) and the `autoLinkSimilar` graph-node embedding.
+> - **Migration from 0.3.x: the engine-managed table is `_memory_<namespace>`, a different storage backend from the v0.3.x vector collection. Existing v0.3.x memories WILL NOT appear after upgrade — re-capture them.** See "Upgrading from 0.3.x" below.
+> - **`collection` config field becomes the engine `namespace`.** It must now match `^[A-Za-z_][A-Za-z0-9_]*$`. The default `openclaw_memories` continues to work; other custom values with hyphens or other non-identifier characters need updating.
+> - **`recallFiltered` WHERE clauses run engine-side** against the `MEMORY_RECALL(?, ?, ?)` result-set. The plugin auto-rewrites the four legacy column shorthands (`category`, `importance`, `createdAt`, `text`) into the JSON-extract form so most existing call sites keep working unchanged.
+
+## Upgrading from 0.3.x
+
+`@synapcores/openclaw-memory@0.4.0` is a **hard cut**: the storage backend changes, so old memories will not migrate automatically. Steps:
+
+1. Upgrade the SynapCores gateway to `v1.8.5-ce` or newer.
+2. `npm install @synapcores/openclaw-memory@0.4.0`.
+3. If your `collection` config value contains hyphens or other non-identifier characters, rename it to match `^[A-Za-z_][A-Za-z0-9_]*$` before restarting.
+4. (Optional) export any high-value memories from the v0.3.x vector collection (the legacy `openclaw_memories` collection in your gateway) and re-store them via `memory_store` so they land in the new `_memory_<namespace>` table.
+5. (Optional) drop the old vector collection from the gateway once you're sure the export is done.
+
+If your `recallFiltered` callers use plain column names (`category`, `importance`, `createdAt`, `text`), they continue to work via auto-rewrite. Callers using the more general SQL surface should switch to the JSON-extract form (`metadata->>'…'`) directly.
 
 ## Why use this over `@openclaw/memory-lancedb`?
 
@@ -225,9 +239,9 @@ await plugin.extensions.trainRelevanceModel(feedback);
 
 Requires at least 10 samples; throws otherwise. Train periodically (cron / on-demand) — the next `predictRelevance` call will detect the model and switch out of heuristic mode.
 
-Under the hood, v0.2.0 stages feedback rows in a SQL table (`openclaw_memory_relevance_training[_<workspace>]`) on the gateway, then calls `/v1/automl/train` with `target: 'score'` and `task: 'regression'`. The table is preserved across calls so feedback accumulates between sessions; clear it manually with `DROP TABLE` (via `client.executeQuery`) if you want a clean restart.
+Under the hood, v0.4.0 stages feedback rows in a SQL table (`openclaw_memory_relevance_training[_<workspace>]`) on the gateway, then calls `/v1/automl/train` with `target: 'score'` and `task: 'regression'`. The table is preserved across calls so feedback accumulates between sessions; clear it manually with `DROP TABLE` (via `client.executeQuery`) if you want a clean restart. Memory hydration is via `MEMORY_RECALL(?, ?, ?) WHERE id = ?` against the engine's namespace; rows whose memories have been deleted are skipped.
 
-## Roadmap (0.3.0+)
+## Roadmap (0.5.0+)
 
 - **Entity extraction on capture** — parse `@mention` tokens and known-contact names out of incoming text and create `Person` / `Project` graph nodes with `MENTIONS` edges back to the memory.
 - **Tag inference** — auto-classify memories into a configurable tag vocabulary on capture (small classifier or LLM call) so `recallFiltered` queries can use tags out of the box.

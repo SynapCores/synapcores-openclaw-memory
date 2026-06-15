@@ -1,7 +1,7 @@
 {
   "name": "@synapcores/openclaw-memory",
-  "version": "0.3.0",
-  "description": "OpenClaw long-term memory plugin backed by SynapCores AIDB (LanceDB-parity API + SQL filtering, graph relations, AutoML relevance)",
+  "version": "0.4.0",
+  "description": "OpenClaw long-term memory plugin backed by SynapCores AIDB engine-side MEMORY_STORE/RECALL/FORGET primitives + SQL filtering, graph relations, AutoML relevance",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -53,7 +53,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@synapcores/sdk": "^0.4.0",
+    "@synapcores/sdk": "^0.5.0",
     "openai": "^6.17.0",
     "typebox": "^1.1.38"
   },
@@ -77,14 +77,16 @@
     "install": {
       "npmSpec": "@synapcores/openclaw-memory",
       "defaultChoice": "npm",
-      "minHostVersion": ">=2026.4.10"
+      "minHostVersion": ">=2026.4.10",
+      "minSynapCoresEngineVersion": "v1.8.5-ce"
     },
     "build": {
       "openclawVersion": "2026.5.12",
       "pluginSdkVersion": "2026.5.12"
     },
     "compat": {
-      "pluginApi": ">=2026.5.19"
+      "pluginApi": ">=2026.5.19",
+      "synapcoresEngine": ">=1.8.5-ce"
     },
     "release": {
       "publishToClawHub": true,

@@ -3,17 +3,16 @@
  *
  * Tests the memory plugin functionality including:
  * - Plugin registration and configuration
- * - Memory storage and retrieval (via mocked SynapCores SDK)
+ * - Memory storage and retrieval (via mocked SynapCores SDK MemoryClient)
  * - Auto-recall via hooks
  * - Auto-capture filtering
  * - SynapCores-only extensions: recallFiltered, recallRelated,
  *   predictRelevance, trainRelevanceModel
  *
- * v0.2.0: the fake now mirrors @synapcores/sdk@0.4.0's public surface
- * (`createVectorCollection`, `vectorCollection(name)`, `graph.cypher`,
- * `graph.nodes.create`, `executeQuery`, `automl.*`). The 0.1.0
- * `_getHttpClient()`-based fake is gone because the plugin no longer
- * reaches into the SDK internals.
+ * v0.4.0: the fake now mirrors @synapcores/sdk@0.5.0's `client.memory`
+ * surface (`store`, `recall`, `forget`) for the core hot path, alongside
+ * the previously-covered `graph.cypher`, `graph.nodes.create`,
+ * `executeQuery`, and `automl.*` surfaces still used by the extensions.
  */
 
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
@@ -25,24 +24,21 @@ const liveEnabled = HAS_OPENAI_KEY && process.env.OPENCLAW_LIVE_TEST === "1";
 const describeLive = liveEnabled ? describe : describe.skip;
 
 // ---------------------------------------------------------------------------
-// In-memory fake of the SynapCores SDK (v0.4.0 surface)
+// In-memory fake of the SynapCores SDK (v0.5.0 surface)
 // ---------------------------------------------------------------------------
 // We mock @synapcores/sdk before importing the plugin so that no network I/O
 // happens during unit tests. The fake implements just enough of the
-// `SynapCores` client to back the plugin's store / search / delete / count /
-// graph.cypher / graph.nodes.create / executeQuery / automl.train /
-// automl.listModels / automl.getModel paths against in-process state.
+// `SynapCores` client to back the plugin's core memory ops (store / recall /
+// forget) AND the extension paths (graph.cypher, automl.*, executeQuery).
 
-type FakeVec = {
+type FakeMemoryRecord = {
   id: string;
-  values: number[];
-  metadata: {
-    text?: string;
-    importance?: number;
-    category?: string;
-    createdAt?: number;
-    [k: string]: unknown;
-  };
+  content: string;
+  metadata: Record<string, unknown> | null;
+  createdAt: Date;
+  // Engine doesn't expose this, but we cache it for deterministic similarity
+  // ranking in the fake.
+  embedding: number[];
 };
 
 type FakeGraphNode = {
@@ -65,70 +61,111 @@ function cosineSim(a: number[], b: number[]): number {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
-class FakeVectorCollection {
-  public vectors = new Map<string, FakeVec>();
-  public lastSearchFilter: unknown = undefined;
-  constructor(public readonly name: string) {}
-
-  async insert(records: FakeVec | FakeVec[]): Promise<{ inserted: number; ids: string[] }> {
-    const arr = Array.isArray(records) ? records : [records];
-    const ids: string[] = [];
-    for (const v of arr) {
-      this.vectors.set(v.id, {
-        id: v.id,
-        values: v.values ?? [],
-        metadata: { ...(v.metadata ?? {}) },
-      });
-      ids.push(v.id);
-    }
-    return { inserted: ids.length, ids };
+function tokenize(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 0);
+}
+function hashStr(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h * 31) + s.charCodeAt(i)) >>> 0;
   }
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  async search(options: { vector: number[]; k?: number; topK?: number; filter?: any; includeMetadata?: boolean }): Promise<Array<{ id: string; score: number; metadata?: Record<string, unknown>; values?: number[] }>> {
-    this.lastSearchFilter = options.filter;
-    const k = options.k ?? options.topK ?? 10;
-    const scored = Array.from(this.vectors.values()).map((v) => {
-      const sim = cosineSim(options.vector, v.values);
-      const distance = 1 - sim;
-      return {
-        id: v.id,
-        // Mirror the gateway: `score` IS the cosine distance.
-        score: distance,
-        metadata: v.metadata,
-        values: v.values,
-      };
-    });
-    scored.sort((a, b) => a.score - b.score);
-    return scored.slice(0, k);
+  return h;
+}
+function deterministicEmbed(text: string): number[] {
+  // Same token-bucket scheme as the OpenAI mock so that cosines line up
+  // between the engine-side store (this fake) and the OpenAI-side cosine
+  // (the OpenAI mock below).
+  const dim = 1536;
+  const vec = new Array<number>(dim).fill(0);
+  for (const tok of tokenize(text)) {
+    const h = hashStr(tok);
+    const idx = h % dim;
+    vec[idx] += 1;
+    vec[(idx + 7) % dim] += 0.5;
+    vec[(idx + 17) % dim] += 0.5;
   }
+  return vec;
+}
 
-  async get(id: string): Promise<{ id: string; values: number[]; metadata: Record<string, unknown> } | null> {
-    const v = this.vectors.get(id);
-    if (!v) return null;
-    return { id: v.id, values: v.values, metadata: v.metadata };
-  }
+let memoryIdCounter = 0;
+function nextMemoryId(): string {
+  memoryIdCounter += 1;
+  return `mem_${memoryIdCounter.toString(16)}_${Math.random().toString(36).slice(2, 8)}`;
+}
 
-  async delete(ids: string | string[]): Promise<{ deleted: number }> {
-    const list = typeof ids === "string" ? [ids] : ids;
-    let n = 0;
-    for (const i of list) {
-      if (this.vectors.delete(i)) n++;
-    }
-    return { deleted: n };
-  }
+class FakeMemoryClient {
+  // namespace -> records
+  public stores = new Map<string, FakeMemoryRecord[]>();
+  public storeCalls: Array<{ namespace: string; content: string; metadata?: Record<string, unknown> }> = [];
+  public recallCalls: Array<{ namespace: string; query: string; topK: number }> = [];
+  public forgetCalls: Array<{ namespace: string; id: string }> = [];
 
-  async count(): Promise<number> {
-    return this.vectors.size;
-  }
+  constructor(private readonly client: FakeSynapCores) {}
 
-  async info(): Promise<{ name: string; dimensions: number; vector_count: number; distance_metric: string }> {
-    return {
-      name: this.name,
-      dimensions: 1536,
-      vector_count: this.vectors.size,
-      distance_metric: "cosine",
+  async store(
+    namespace: string,
+    content: string,
+    options?: { metadata?: Record<string, unknown> },
+  ): Promise<string> {
+    this.assertNamespace(namespace);
+    this.storeCalls.push({ namespace, content, metadata: options?.metadata });
+    const id = nextMemoryId();
+    const record: FakeMemoryRecord = {
+      id,
+      content,
+      metadata: options?.metadata ?? null,
+      createdAt: new Date(),
+      embedding: deterministicEmbed(content),
     };
+    const rows = this.stores.get(namespace) ?? [];
+    rows.push(record);
+    this.stores.set(namespace, rows);
+    return id;
+  }
+
+  async recall(
+    namespace: string,
+    query: string,
+    options?: { topK?: number },
+  ): Promise<Array<{
+    id: string;
+    content: string;
+    similarity: number;
+    metadata: Record<string, unknown> | null;
+    createdAt: Date;
+  }>> {
+    this.assertNamespace(namespace);
+    const topK = options?.topK ?? 10;
+    this.recallCalls.push({ namespace, query, topK });
+    const rows = this.stores.get(namespace);
+    if (!rows) return [];
+    const qVec = deterministicEmbed(query);
+    const scored = rows.map((r) => ({
+      id: r.id,
+      content: r.content,
+      similarity: cosineSim(qVec, r.embedding),
+      metadata: r.metadata,
+      createdAt: r.createdAt,
+    }));
+    scored.sort((a, b) => b.similarity - a.similarity);
+    return scored.slice(0, topK);
+  }
+
+  async forget(namespace: string, id: string): Promise<boolean> {
+    this.assertNamespace(namespace);
+    this.forgetCalls.push({ namespace, id });
+    const rows = this.stores.get(namespace);
+    if (!rows) return false;
+    const before = rows.length;
+    const next = rows.filter((r) => r.id !== id);
+    this.stores.set(namespace, next);
+    return next.length !== before;
+  }
+
+  private assertNamespace(namespace: string): void {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(namespace)) {
+      throw new Error(`Invalid namespace '${namespace}'`);
+    }
   }
 }
 
@@ -147,7 +184,6 @@ class FakeGraphNodesApi {
     };
     this.graph.allNodes.push(node);
     this.graph.nodeIndexById.set(id, node);
-    // Also index by the user-supplied `id` property so MATCH (n:Memory {id: 'X'}) works
     const userId = props.id ? String(props.id) : id;
     this.graph.nodeIndexByUserId.set(userId, node);
     return node;
@@ -159,7 +195,6 @@ class FakeGraph {
   public nodeIndexById = new Map<string, FakeGraphNode>();
   public nodeIndexByUserId = new Map<string, FakeGraphNode>();
   public cypherCalls: CypherCall[] = [];
-  // `nodes` matches the SDK 0.4.0 surface: client.graph.nodes.create(label, props)
   public readonly nodes: FakeGraphNodesApi;
 
   constructor() {
@@ -169,10 +204,9 @@ class FakeGraph {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async cypher(query: string, params?: Record<string, any>, graph?: string): Promise<{ columns: string[]; rows: unknown[][]; records: Array<Record<string, unknown>> }> {
     this.cypherCalls.push({ query, params, graph });
-    // Inline-only contract (gateway v1.6.5.x rejects $param bindings).
     if (params !== undefined && Object.keys(params).length > 0) {
       throw new Error(
-        `FakeGraph.cypher: gateway v1.6.5.x rejects $param bindings; caller passed params=${JSON.stringify(
+        `FakeGraph.cypher: gateway rejects $param bindings; caller passed params=${JSON.stringify(
           params,
         )}.`,
       );
@@ -261,50 +295,90 @@ class FakeAutoML {
 }
 
 class FakeSynapCores {
-  private vectorCollections = new Map<string, FakeVectorCollection>();
   public graph = new FakeGraph();
   public automl = new FakeAutoML();
+  public readonly memory: FakeMemoryClient;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public sqlCalls: Array<{ sql: string; parameters?: any[] }> = [];
   // Synthetic in-memory SQL tables for executeQuery
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public sqlTables = new Map<string, Array<Record<string, any>>>();
 
-  async listVectorCollections(): Promise<Array<{ name: string; dimensions: number; vector_count: number; distance_metric: string }>> {
-    return Array.from(this.vectorCollections.values()).map((c) => ({
-      name: c.name,
-      dimensions: 1536,
-      vector_count: c.vectors.size,
-      distance_metric: "cosine",
-    }));
-  }
-
-  async createVectorCollection(opts: { name: string; dimensions: number; distance_metric?: string }): Promise<FakeVectorCollection> {
-    let c = this.vectorCollections.get(opts.name);
-    if (!c) {
-      c = new FakeVectorCollection(opts.name);
-      this.vectorCollections.set(opts.name, c);
-    }
-    return c;
-  }
-
-  vectorCollection(name: string): FakeVectorCollection {
-    let c = this.vectorCollections.get(name);
-    if (!c) {
-      c = new FakeVectorCollection(name);
-      this.vectorCollections.set(name, c);
-    }
-    return c;
-  }
-
-  async deleteVectorCollection(name: string): Promise<void> {
-    this.vectorCollections.delete(name);
+  constructor() {
+    this.memory = new FakeMemoryClient(this);
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async executeQuery(req: { sql: string; parameters?: any[] }): Promise<any> {
     this.sqlCalls.push(req);
     const sql = req.sql.trim();
+
+    // SELECT 1 — preflight probe
+    if (/^SELECT\s+1\s*$/i.test(sql)) {
+      return {
+        columns: [{ name: "1", data_type: "INTEGER", nullable: false }],
+        rows: [[1]],
+        execution_time_ms: 0,
+      };
+    }
+
+    // SELECT … FROM MEMORY_RECALL(?, ?, ?) [WHERE …] [LIMIT N]
+    if (/MEMORY_RECALL\s*\(\s*\?\s*,\s*\?\s*,\s*\?\s*\)/i.test(sql)) {
+      const [namespace, query, topK, ...rest] = req.parameters ?? [];
+      const records = this.memory.stores.get(namespace) ?? [];
+      const qVec = deterministicEmbed(String(query ?? ""));
+      let scored = records.map((r) => ({
+        id: r.id,
+        content: r.content,
+        similarity: cosineSim(qVec, r.embedding),
+        metadata: r.metadata,
+        created_at: r.createdAt.toISOString(),
+      }));
+      scored.sort((a, b) => b.similarity - a.similarity);
+      scored = scored.slice(0, Number(topK) || 10);
+
+      // Tiny WHERE-clause evaluator that handles the cases the plugin emits:
+      //  - id = ? (with placeholder)
+      //  - id = 'literal'
+      //  - JSON-extract on metadata->>'…' (with literal RHS)
+      //  - similarity > N
+      // Plus AND combinators.
+      const whereMatch = sql.match(/WHERE\s+(.*?)(?:\s+LIMIT\s+\d+)?$/i);
+      if (whereMatch) {
+        const whereClause = whereMatch[1];
+        const placeholders = rest.slice();
+        let cursor = 0;
+        const resolvedClause = whereClause.replace(/\?/g, () => {
+          const v = placeholders[cursor++];
+          return typeof v === "string" ? `'${v}'` : String(v);
+        });
+        scored = scored.filter((row) => evalSimpleWhere(resolvedClause, row));
+      }
+
+      const limitMatch = sql.match(/LIMIT\s+(\d+)/i);
+      if (limitMatch) {
+        scored = scored.slice(0, Number(limitMatch[1]));
+      }
+
+      return {
+        columns: [
+          { name: "id", data_type: "TEXT", nullable: false },
+          { name: "content", data_type: "TEXT", nullable: false },
+          { name: "similarity", data_type: "REAL", nullable: false },
+          { name: "metadata", data_type: "TEXT", nullable: true },
+          { name: "created_at", data_type: "TEXT", nullable: false },
+        ],
+        rows: scored.map((r) => [
+          r.id,
+          r.content,
+          r.similarity,
+          r.metadata == null ? null : JSON.stringify(r.metadata),
+          r.created_at,
+        ]),
+        execution_time_ms: 0,
+      };
+    }
+
     // CREATE TABLE <name> (...)
     let m = sql.match(/^CREATE TABLE\s+(\w+)/i);
     if (m) {
@@ -316,6 +390,7 @@ class FakeSynapCores {
         execution_time_ms: 0,
       };
     }
+
     // INSERT INTO <name> (cols) VALUES (vals)
     m = sql.match(/^INSERT INTO\s+(\w+)\s*\(([^)]*)\)\s*VALUES\s*\(([^)]*)\)/i);
     if (m) {
@@ -332,25 +407,39 @@ class FakeSynapCores {
       this.sqlTables.set(t, rows);
       return { columns: [], rows: [], rows_affected: 1, execution_time_ms: 0 };
     }
+
     // SELECT COUNT(*) FROM <name>
     m = sql.match(/^SELECT COUNT\(\*\) FROM\s+(\w+)/i);
     if (m) {
       const t = m[1];
-      const n = (this.sqlTables.get(t) ?? []).length;
+      const tableName = t.startsWith("_memory_") ? t : t;
+      // For _memory_<ns>, count from the memory store
+      if (tableName.startsWith("_memory_")) {
+        const ns = tableName.slice("_memory_".length);
+        const rows = this.memory.stores.get(ns) ?? [];
+        return {
+          columns: [{ name: "count", data_type: "INTEGER", nullable: true }],
+          rows: [[rows.length]],
+          execution_time_ms: 0,
+        };
+      }
+      const n = (this.sqlTables.get(tableName) ?? []).length;
       return {
         columns: [{ name: "count", data_type: "INTEGER", nullable: true }],
         rows: [[n]],
         execution_time_ms: 0,
       };
     }
+
     return { columns: [], rows: [], execution_time_ms: 0 };
   }
 
-  // SDK 0.4.0 still ships a broken `graph.nodes.create` (posts `label:`
-  // singular, gateway expects `labels:` plural). The plugin works around
-  // this in `linkSimilarMemories` by reaching into `_getHttpClient().post`
-  // with the correct wire shape. The fake mirrors that path for unit-test
-  // coverage of the workaround.
+  // SDK 0.5.0 dropped the `client.graph.*` accessors; the plugin now
+  // reaches through `_getHttpClient` for both `/graph/nodes` (the
+  // node-create workaround the SDK has always shipped wrong) and
+  // `/graph/match` (the cypher endpoint that used to be wrapped by
+  // `client.graph.cypher` in older SDK versions). The fake mirrors
+  // both paths so the plugin's workarounds round-trip in-process.
   _getHttpClient(): {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     post: (path: string, body?: any) => Promise<{ data: unknown }>;
@@ -362,8 +451,6 @@ class FakeSynapCores {
         if (path === "/graph/nodes") {
           const labels = Array.isArray(body?.labels) ? body.labels : [];
           const props = body?.properties ?? {};
-          // Mirror what client.graph.nodes.create() would do via the API
-          // surface so the same downstream cypher walks work.
           const id = String(props.id ?? `gn-${self.graph.allNodes.length + 1}`);
           const node: FakeGraphNode = { id, labels: [...labels], properties: { ...props } };
           self.graph.allNodes.push(node);
@@ -371,15 +458,94 @@ class FakeSynapCores {
           self.graph.nodeIndexByUserId.set(String(props.id ?? id), node);
           return { data: { id, labels, properties: props } };
         }
+        if (path === "/graph/match") {
+          const sql = String(body?.sql ?? "");
+          const result = await self.graph.cypher(sql);
+          return { data: { columns: result.columns, rows: result.rows, count: result.rows.length } };
+        }
         throw new Error(`FakeSynapCores._getHttpClient: unhandled POST ${path}`);
       },
     };
   }
+}
 
-  // Test helpers
-  _peekVectorCollection(name: string): FakeVectorCollection | undefined {
-    return this.vectorCollections.get(name);
+/**
+ * Tiny WHERE-clause evaluator restricted to the operators the plugin emits.
+ * Supports `<lhs> <op> <rhs>` joined by AND/OR, where:
+ *   - lhs ∈ { id, content, similarity, metadata->>'<key>' (with optional CAST(...)) }
+ *   - op  ∈ { =, !=, <, <=, >, >= }
+ *   - rhs ∈ { string literal in quotes, numeric literal }
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function evalSimpleWhere(clause: string, row: Record<string, any>): boolean {
+  const tokens = clause.split(/\s+(AND|OR)\s+/i);
+  let result = true;
+  let combinator: "AND" | "OR" = "AND";
+  for (const tok of tokens) {
+    if (/^(AND|OR)$/i.test(tok)) {
+      combinator = tok.toUpperCase() as "AND" | "OR";
+      continue;
+    }
+    const evald = evalAtom(tok.trim(), row);
+    if (combinator === "AND") result = result && evald;
+    else result = result || evald;
   }
+  return result;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function evalAtom(atom: string, row: Record<string, any>): boolean {
+  // Require whitespace around the operator so the `>>` and `->` glyphs in
+  // `metadata->>'key'` aren't mistaken for `>` / `<` comparison ops.
+  const m = atom.match(/^(.+?)\s+(=|!=|<=|>=|<|>)\s+(.+)$/);
+  if (!m) return true;
+  const [, lhsRaw, op, rhsRaw] = m;
+  const lhs = resolveLhs(lhsRaw.trim(), row);
+  const rhs = resolveRhs(rhsRaw.trim());
+  switch (op) {
+    case "=":
+      return String(lhs) === String(rhs);
+    case "!=":
+      return String(lhs) !== String(rhs);
+    case "<":
+      return Number(lhs) < Number(rhs);
+    case "<=":
+      return Number(lhs) <= Number(rhs);
+    case ">":
+      return Number(lhs) > Number(rhs);
+    case ">=":
+      return Number(lhs) >= Number(rhs);
+  }
+  return true;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function resolveLhs(expr: string, row: Record<string, any>): unknown {
+  // CAST(metadata->>'key' AS REAL|INTEGER)
+  let m = expr.match(/^CAST\s*\(\s*metadata->>'([^']+)'\s+AS\s+(\w+)\s*\)$/i);
+  if (m) {
+    const key = m[1];
+    const meta = row.metadata;
+    const val = meta && typeof meta === "object" ? meta[key] : undefined;
+    return Number(val);
+  }
+  m = expr.match(/^metadata->>'([^']+)'$/);
+  if (m) {
+    const key = m[1];
+    const meta = row.metadata;
+    return meta && typeof meta === "object" ? meta[key] : undefined;
+  }
+  if (expr === "id") return row.id;
+  if (expr === "content") return row.content;
+  if (expr === "similarity") return row.similarity;
+  return expr;
+}
+
+function resolveRhs(expr: string): unknown {
+  if (/^'.*'$/.test(expr)) return expr.slice(1, -1);
+  const n = Number(expr);
+  if (Number.isFinite(n)) return n;
+  return expr;
 }
 
 // Pre-allocate a single fake we can inspect from each test. We stash it on
@@ -398,7 +564,7 @@ vi.mock("@synapcores/sdk", () => ({
     return mockState.lastFake;
   }),
   // Empty marker class; the plugin never instantiates it directly.
-  VectorCollection: class {},
+  MemoryClient: class {},
 }));
 
 function getLastFake(): FakeSynapCores {
@@ -416,32 +582,13 @@ function getLastFake(): FakeSynapCores {
 //   - "a b c d e" vs "a b c d e f" -> cosine ~0.94
 //   - texts sharing no tokens -> cosine 0
 vi.mock("openai", () => {
-  function tokenize(text: string): string[] {
-    return text.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 0);
-  }
-  function hashStr(s: string): number {
-    let h = 0;
-    for (let i = 0; i < s.length; i++) {
-      h = ((h * 31) + s.charCodeAt(i)) >>> 0;
-    }
-    return h;
-  }
   return {
     default: class OpenAIMock {
       embeddings = {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         create: async ({ input }: { input: string | string[] }): Promise<any> => {
           const text = Array.isArray(input) ? input[0] : input;
-          const dim = 1536;
-          const vec = new Array<number>(dim).fill(0);
-          for (const tok of tokenize(text)) {
-            const h = hashStr(tok);
-            const idx = h % dim;
-            vec[idx] += 1;
-            vec[(idx + 7) % dim] += 0.5;
-            vec[(idx + 17) % dim] += 0.5;
-          }
-          return { data: [{ embedding: vec }] };
+          return { data: [{ embedding: deterministicEmbed(text) }] };
         },
       };
     },
@@ -702,7 +849,7 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     };
   }
 
-  test("memory tools work end-to-end (store, recall, duplicate, forget)", async () => {
+  test("memory tools work end-to-end (store, recall, duplicate, forget) — backed by client.memory", async () => {
     const { default: memoryPlugin } = await import("./index.js");
     const { mockApi, registeredTools, registeredClis, registeredServices } = buildMockApi({
       autoLinkSimilar: false,
@@ -732,6 +879,16 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     expect(storeResult.details?.id).toBeDefined();
     const storedId = storeResult.details?.id;
 
+    // The fake's MemoryClient should have seen exactly one store call.
+    const fake = getLastFake();
+    expect(fake.memory.storeCalls.length).toBe(1);
+    expect(fake.memory.storeCalls[0].namespace).toBe("openclaw_memories_test");
+    expect(fake.memory.storeCalls[0].content).toBe("The user prefers dark mode for all applications");
+    expect(fake.memory.storeCalls[0].metadata).toMatchObject({
+      importance: 0.8,
+      category: "preference",
+    });
+
     // Recall
     const recallResult = await recallTool.execute("test-call-2", {
       query: "The user prefers dark mode for all applications",
@@ -739,6 +896,7 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     });
     expect(recallResult.details?.count).toBeGreaterThan(0);
     expect(recallResult.details?.memories?.[0]?.text).toContain("dark mode");
+    expect(fake.memory.recallCalls.length).toBeGreaterThan(0);
 
     // Duplicate detection
     const duplicateResult = await storeTool.execute("test-call-3", {
@@ -751,6 +909,8 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
       memoryId: storedId,
     });
     expect(forgetResult.details?.action).toBe("deleted");
+    expect(fake.memory.forgetCalls.length).toBe(1);
+    expect(fake.memory.forgetCalls[0].id).toBe(storedId);
 
     // Verify it's gone
     const recallAfterForget = await recallTool.execute("test-call-5", {
@@ -758,6 +918,65 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
       limit: 5,
     });
     expect(recallAfterForget.details?.count).toBe(0);
+  }, 30000);
+
+  test("regression: store → recall returns the right content + metadata roundtrips + namespace isolation + forget removes", async () => {
+    // End-to-end regression that the v0.3.x guarantees still hold after the
+    // v0.4.0 MemoryClient swap.
+    const { default: memoryPlugin } = await import("./index.js");
+
+    // Namespace A
+    const { mockApi: apiA, registeredTools: toolsA } = buildMockApi({
+      autoLinkSimilar: false,
+      collection: "ns_alpha",
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(apiA as any);
+    const fakeA = getLastFake();
+    const storeA = toolsA.find((t) => t.opts?.name === "memory_store")!.tool;
+    const recallA = toolsA.find((t) => t.opts?.name === "memory_recall")!.tool;
+    const forgetA = toolsA.find((t) => t.opts?.name === "memory_forget")!.tool;
+
+    const r = await storeA.execute("x", {
+      text: "Alpha namespace remembers the violet preference",
+      importance: 0.91,
+      category: "preference",
+    });
+    const idA = r.details.id;
+
+    // Recall returns the right content + correct metadata.
+    const rec = await recallA.execute("y", {
+      query: "violet preference",
+      limit: 5,
+    });
+    expect(rec.details.count).toBe(1);
+    expect(rec.details.memories[0].text).toBe("Alpha namespace remembers the violet preference");
+    expect(rec.details.memories[0].category).toBe("preference");
+    expect(rec.details.memories[0].importance).toBeCloseTo(0.91, 5);
+
+    // Namespace B sees nothing.
+    const { mockApi: apiB, registeredTools: toolsB } = buildMockApi({
+      autoLinkSimilar: false,
+      collection: "ns_beta",
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(apiB as any);
+    const fakeB = getLastFake();
+    expect(fakeB).not.toBe(fakeA); // distinct client instances
+    const recallB = toolsB.find((t) => t.opts?.name === "memory_recall")!.tool;
+    const rb = await recallB.execute("z", {
+      query: "violet preference",
+      limit: 5,
+    });
+    expect(rb.details.count).toBe(0);
+
+    // Forget by id removes from namespace A.
+    await forgetA.execute("d", { memoryId: idA });
+    const recAfter = await recallA.execute("e", {
+      query: "violet preference",
+      limit: 5,
+    });
+    expect(recAfter.details.count).toBe(0);
   }, 30000);
 
   test("SynapCores extensions are exposed on the plugin instance", async () => {
@@ -776,7 +995,7 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     expect(typeof ext.trainRelevanceModel).toBe("function");
   });
 
-  test("recallFiltered embeds the semantic query and forwards the WHERE clause as a filter", async () => {
+  test("recallFiltered runs the WHERE clause engine-side against MEMORY_RECALL output (legacy shorthand auto-rewrites)", async () => {
     const { default: memoryPlugin } = await import("./index.js");
     const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: false });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -803,14 +1022,20 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     });
     expect(Array.isArray(results)).toBe(true);
     expect(results.length).toBeGreaterThan(0);
+    for (const r of results) {
+      expect(r.entry.category).toBe("preference");
+    }
 
-    // Inspect what filter the SDK saw.
+    // The plugin emits MEMORY_RECALL via executeQuery; the legacy bare
+    // `category` identifier should have been rewritten into the JSON-extract
+    // form by `rewriteLegacyWhere` before submission.
     const fake = getLastFake();
-    const coll = fake._peekVectorCollection("openclaw_memories_test")!;
-    expect(coll.lastSearchFilter).toEqual({ sql: "category = 'preference'" });
+    const memCalls = fake.sqlCalls.filter((c) => /MEMORY_RECALL/.test(c.sql));
+    expect(memCalls.length).toBeGreaterThan(0);
+    expect(memCalls[0].sql).toMatch(/metadata->>'category'/);
   });
 
-  test("recallFiltered with where '1=1' behaves like recall (forwards 1=1 filter)", async () => {
+  test("recallFiltered with where '1=1' falls through to a plain MEMORY_RECALL call", async () => {
     const { default: memoryPlugin } = await import("./index.js");
     const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: false });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -827,16 +1052,15 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     });
     expect(results.length).toBeGreaterThan(0);
     const fake = getLastFake();
-    const coll = fake._peekVectorCollection("openclaw_memories_test")!;
-    expect(coll.lastSearchFilter).toEqual({ sql: "1=1" });
+    const memCalls = fake.sqlCalls.filter((c) => /MEMORY_RECALL/.test(c.sql));
+    expect(memCalls.length).toBeGreaterThan(0);
+    expect(memCalls[0].sql).toMatch(/WHERE 1=1/);
   });
 
-  test("v0.2.0: capture inserts a Memory graph node when autoLinkSimilar=true (was a no-op in v0.1.0)", async () => {
-    // v0.1.0 was a no-op — explicit MERGE on SIMILAR_TO is rejected by the
-    // gateway. v0.2.0 takes the supported path: insert a Memory node
-    // carrying the embedding under the property name `embedding`, so the
-    // gateway's vector-indexed synthetic SIMILAR_TO edge resolves at
-    // MATCH time in `recallRelated`.
+  test("capture inserts a Memory graph node when autoLinkSimilar=true (embedded via OpenAI)", async () => {
+    // The graph node is the v0.3.0/v0.4.0 hand-off point that makes
+    // recallRelated work. The plugin still writes it via _getHttpClient
+    // because the SDK's graph.nodes.create still uses the wrong wire shape.
     const { default: memoryPlugin } = await import("./index.js");
     const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: true });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -846,13 +1070,9 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     const r1 = await storeTool.execute("c1", { text: "The user prefers dark mode for all applications" });
     const r2 = await storeTool.execute("c2", { text: "User Alice manages the analytics dashboard project" });
     const fake = getLastFake();
-    // Two Memory nodes; no Cypher MERGE writes (that was the v0.1.0 anti-path).
     expect(fake.graph.nodeIndexByUserId.size).toBe(2);
     expect(fake.graph.nodeIndexByUserId.get(r1.details.id)?.labels).toEqual(["Memory"]);
     expect(fake.graph.nodeIndexByUserId.get(r2.details.id)?.labels).toEqual(["Memory"]);
-    // Each Memory node carries the embedding under `embedding` — that's
-    // the property name the gateway's brute-force vector index is wired
-    // against (attach_default_vector_index).
     const n1 = fake.graph.nodeIndexByUserId.get(r1.details.id)!;
     expect(Array.isArray(n1.properties.embedding)).toBe(true);
     expect((n1.properties.embedding as number[]).length).toBeGreaterThan(0);
@@ -873,11 +1093,7 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     expect(fake.graph.cypherCalls.length).toBe(0);
   });
 
-  test("v0.2.0: recallRelated walks the synthetic SIMILAR_TO graph and returns related Memory nodes", async () => {
-    // Mocks the v0.2.0 wire shape: a Memory node carries an `embedding`
-    // property; the gateway derives SIMILAR_TO synthetically by cosine
-    // similarity at MATCH time. The fake reproduces that path in-process
-    // so the same Cypher the plugin emits round-trips here.
+  test("recallRelated walks the synthetic SIMILAR_TO graph and returns related Memory nodes", async () => {
     const { default: memoryPlugin } = await import("./index.js");
     const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: true });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -886,27 +1102,20 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     const ext = (memoryPlugin as any).extensions;
     const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")?.tool;
 
-    // Capture two related memories (shared "dark mode" tokens => cosine ~ 1).
     const a = await storeTool.execute("c1", { text: "I prefer dark mode for everything" });
     await storeTool.execute("c2", { text: "I prefer dark mode in editors" });
-    // And one unrelated memory (no shared tokens).
     await storeTool.execute("c3", { text: "Decision: PostgreSQL for analytics" });
 
     const related = await ext.recallRelated(a.details.id, { hops: 1, similarityThreshold: 0.5 });
     expect(Array.isArray(related)).toBe(true);
-    // The two "dark mode" memories share many tokens, so c2 should surface.
     expect(related.length).toBeGreaterThanOrEqual(1);
-    // c1 (the source) must NOT appear in its own neighborhood.
     expect(related.find((r: { entry: { id: string } }) => r.entry.id === a.details.id)).toBeUndefined();
-    // Each result carries hops and via.
     for (const r of related) {
       expect(r.hops).toBe(1);
       expect(r.via).toContain("SIMILAR_TO");
       expect(r.entry.text).toContain("dark");
     }
 
-    // The gateway was hit with a SIMILAR_TO Cypher MATCH — inline values,
-    // no $param bindings (which the gateway rejects).
     const fake = getLastFake();
     const cypherCalls = fake.graph.cypherCalls;
     expect(cypherCalls.length).toBeGreaterThan(0);
@@ -921,7 +1130,7 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     memoryPlugin.register(mockApi as any);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ext = (memoryPlugin as any).extensions;
-    const related = await ext.recallRelated("00000000-0000-0000-0000-000000000000", { hops: 1 });
+    const related = await ext.recallRelated("mem_unknown_xxxx", { hops: 1 });
     expect(related).toEqual([]);
   });
 
@@ -935,15 +1144,11 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")?.tool;
     const r = await storeTool.execute("c1", { text: "I prefer dark mode for everything" });
 
-    // Custom edge kind — the fake's cypher doesn't model MENTIONS, so the
-    // result will be empty, but the plugin must emit a Cypher that uses
-    // `MENTIONS*1..2` (multi-hop for non-synthetic edges) without throwing.
     const related = await ext.recallRelated(r.details.id, { hops: 2, edgeKinds: ["MENTIONS"] });
     expect(related).toEqual([]);
     const fake = getLastFake();
     const last = fake.graph.cypherCalls[fake.graph.cypherCalls.length - 1];
     expect(last.query).toMatch(/MENTIONS\*1\.\.2/);
-    // SIMILAR_TO does NOT appear (caller opted out)
     expect(last.query).not.toMatch(/SIMILAR_TO/);
   });
 
@@ -967,18 +1172,17 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     void r2;
 
     const fake = getLastFake();
-    // No models registered -> falls back to heuristic
     expect(fake.automl.models.length).toBe(0);
 
-    // Build candidate entries from the fake vectors
-    const coll = fake._peekVectorCollection("openclaw_memories_test")!;
-    const candidates = Array.from(coll.vectors.values()).map((v) => ({
+    // Build candidate entries from the memory store
+    const records = fake.memory.stores.get("openclaw_memories_test") ?? [];
+    const candidates = records.map((v) => ({
       id: v.id,
-      text: String(v.metadata.text ?? ""),
-      vector: v.values,
-      importance: typeof v.metadata.importance === "number" ? v.metadata.importance : 0,
-      category: ((v.metadata.category as string) ?? "other") as "preference" | "fact" | "decision" | "entity" | "other",
-      createdAt: typeof v.metadata.createdAt === "number" ? v.metadata.createdAt : Date.now(),
+      text: v.content,
+      vector: [] as number[],
+      importance: typeof v.metadata?.importance === "number" ? v.metadata!.importance as number : 0,
+      category: (v.metadata?.category as string ?? "other") as "preference" | "fact" | "decision" | "entity" | "other",
+      createdAt: v.createdAt.getTime(),
     }));
 
     const scored = await ext.predictRelevance("dark mode preference", candidates);
@@ -987,7 +1191,6 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
       expect(s.relevance).toBeGreaterThanOrEqual(0);
       expect(s.relevance).toBeLessThanOrEqual(1);
     }
-    // The model.predict path was NOT called
     expect(fake.automl.modelInstances.size).toBe(0);
   });
 
@@ -1010,14 +1213,14 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
       status: "completed",
     });
 
-    const coll = fake._peekVectorCollection("openclaw_memories_test")!;
-    const candidates = Array.from(coll.vectors.values()).map((v) => ({
+    const records = fake.memory.stores.get("openclaw_memories_test") ?? [];
+    const candidates = records.map((v) => ({
       id: v.id,
-      text: String(v.metadata.text ?? ""),
-      vector: v.values,
-      importance: typeof v.metadata.importance === "number" ? v.metadata.importance : 0,
-      category: ((v.metadata.category as string) ?? "other") as "preference" | "fact" | "decision" | "entity" | "other",
-      createdAt: typeof v.metadata.createdAt === "number" ? v.metadata.createdAt : Date.now(),
+      text: v.content,
+      vector: [] as number[],
+      importance: typeof v.metadata?.importance === "number" ? v.metadata!.importance as number : 0,
+      category: (v.metadata?.category as string ?? "other") as "preference" | "fact" | "decision" | "entity" | "other",
+      createdAt: v.createdAt.getTime(),
     }));
 
     const scored = await ext.predictRelevance("dark mode", candidates);
@@ -1038,18 +1241,14 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     const ext = (memoryPlugin as any).extensions;
     await expect(ext.trainRelevanceModel([])).rejects.toThrow(/at least 10 samples/);
     const tiny = Array.from({ length: 5 }, (_, i) => ({
-      memoryId: "00000000-0000-0000-0000-00000000000" + i,
+      memoryId: "mem_xxxx_" + i,
       queryText: "q",
       score: 0.5,
     }));
     await expect(ext.trainRelevanceModel(tiny)).rejects.toThrow(/at least 10 samples/);
   });
 
-  test("v0.2.0: trainRelevanceModel stages rows in a SQL table then calls automl.train", async () => {
-    // v0.1.0 threw "signature-only" on this path. v0.2.0 stages each
-    // feedback row's hydrated feature vector in a CREATE TABLE / INSERT
-    // pipeline, then calls /v1/automl/train with the staging table as
-    // `collection` and `target: 'score'`.
+  test("trainRelevanceModel stages rows in a SQL table then calls automl.train", async () => {
     const { default: memoryPlugin } = await import("./index.js");
     const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: false });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1079,18 +1278,15 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     expect(result.modelId).toBeDefined();
 
     const fake = getLastFake();
-    // SQL pipeline ran: 1 CREATE + 12 INSERTs
     const createCalls = fake.sqlCalls.filter((c) => /^CREATE TABLE/i.test(c.sql));
     const insertCalls = fake.sqlCalls.filter((c) => /^INSERT INTO/i.test(c.sql));
     expect(createCalls.length).toBe(1);
     expect(insertCalls.length).toBe(12);
     expect(createCalls[0].sql).toMatch(/CREATE TABLE openclaw_memory_relevance_training\b/);
-    // AutoML train was called with the staging table as `collection`
     expect(fake.automl.trainCalls.length).toBe(1);
     expect(fake.automl.trainCalls[0].collection).toMatch(/^openclaw_memory_relevance_training/);
     expect(fake.automl.trainCalls[0].target).toBe("score");
     expect(fake.automl.trainCalls[0].task).toBe("regression");
-    // The trained model is then visible to subsequent predictRelevance calls
     const post = await ext.predictRelevance("test", [{
       id: ids[0],
       text: "x",
@@ -1118,7 +1314,6 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
       });
       ids.push(result.details.id);
     }
-    // Wire automl.train to fail
     const fake = getLastFake();
     fake.automl.train = async (): Promise<never> => {
       throw new Error("synthetic training failure");
@@ -1130,6 +1325,15 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     }));
     await expect(ext.trainRelevanceModel(feedback)).rejects.toThrow(/synthetic training failure/);
   }, 30000);
+
+  test("plugin throws if `collection` is not a valid namespace identifier", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi } = buildMockApi({ collection: "openclaw-memories" }); // hyphen!
+    expect(() => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      memoryPlugin.register(mockApi as any);
+    }).toThrow(/valid namespace/);
+  });
 });
 
 describe("escapeCypherString", () => {
@@ -1153,10 +1357,10 @@ describe("escapeCypherString", () => {
     expect(escapeCypherString("a\\'b")).toBe("a\\\\\\'b");
   });
 
-  test("a UUID round-trips unchanged (the hot path)", async () => {
+  test("an engine-issued memory id round-trips unchanged (the hot path)", async () => {
     const { escapeCypherString } = await import("./index.js");
-    const uuid = "11111111-2222-3333-4444-555555555555";
-    expect(escapeCypherString(uuid)).toBe(uuid);
+    const id = "mem_1kv69sxfn_5ofzwK";
+    expect(escapeCypherString(id)).toBe(id);
   });
 
   test("the canonical SQL-injection probe gets neutralised inside Cypher", async () => {
