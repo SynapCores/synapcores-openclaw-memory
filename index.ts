@@ -372,7 +372,7 @@ class MemoryDB {
     const rewritten = rewriteLegacyWhere(where);
     const sql =
       "SELECT id, content, similarity, metadata, created_at " +
-      `FROM MEMORY_RECALL(?, ?, ?) WHERE ${rewritten} LIMIT ${Number(limit)}`;
+      `FROM MEMORY_RECALL($1, $2, $3) WHERE ${rewritten} LIMIT ${Number(limit)}`;
     let result;
     try {
       result = await this.client.executeQuery({
@@ -440,7 +440,7 @@ class MemoryDB {
       const result = await this.client.executeQuery({
         sql:
           "SELECT id, content, similarity, metadata, created_at " +
-          "FROM MEMORY_RECALL(?, ?, ?) WHERE id = ? LIMIT 1",
+          "FROM MEMORY_RECALL($1, $2, $3) WHERE id = $4 LIMIT 1",
         parameters: [this.namespace, " ", 100, id],
       });
       const mapped = mapRecallRows(result);

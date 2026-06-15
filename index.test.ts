@@ -322,8 +322,8 @@ class FakeSynapCores {
       };
     }
 
-    // SELECT … FROM MEMORY_RECALL(?, ?, ?) [WHERE …] [LIMIT N]
-    if (/MEMORY_RECALL\s*\(\s*\?\s*,\s*\?\s*,\s*\?\s*\)/i.test(sql)) {
+    // SELECT … FROM MEMORY_RECALL($1, $2, $3) [WHERE …] [LIMIT N]
+    if (/MEMORY_RECALL\s*\(\s*\$\d+\s*,\s*\$\d+\s*,\s*\$\d+\s*\)/i.test(sql)) {
       const [namespace, query, topK, ...rest] = req.parameters ?? [];
       const records = this.memory.stores.get(namespace) ?? [];
       const qVec = deterministicEmbed(String(query ?? ""));
@@ -338,7 +338,7 @@ class FakeSynapCores {
       scored = scored.slice(0, Number(topK) || 10);
 
       // Tiny WHERE-clause evaluator that handles the cases the plugin emits:
-      //  - id = ? (with placeholder)
+      //  - id = $4 (with positional placeholder)
       //  - id = 'literal'
       //  - JSON-extract on metadata->>'…' (with literal RHS)
       //  - similarity > N
@@ -346,10 +346,9 @@ class FakeSynapCores {
       const whereMatch = sql.match(/WHERE\s+(.*?)(?:\s+LIMIT\s+\d+)?$/i);
       if (whereMatch) {
         const whereClause = whereMatch[1];
-        const placeholders = rest.slice();
-        let cursor = 0;
-        const resolvedClause = whereClause.replace(/\?/g, () => {
-          const v = placeholders[cursor++];
+        const allParams = req.parameters ?? [];
+        const resolvedClause = whereClause.replace(/\$(\d+)/g, (_m, idx) => {
+          const v = allParams[Number(idx) - 1];
           return typeof v === "string" ? `'${v}'` : String(v);
         });
         scored = scored.filter((row) => evalSimpleWhere(resolvedClause, row));
