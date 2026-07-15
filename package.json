@@ -1,6 +1,6 @@
 {
   "name": "@synapcores/openclaw-memory",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "OpenClaw long-term memory plugin backed by SynapCores AIDB engine-side MEMORY_STORE/RECALL/FORGET primitives + SQL filtering, graph relations, AutoML relevance",
   "type": "module",
   "main": "./dist/index.js",
