@@ -2,25 +2,25 @@
 
 A long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) that uses **SynapCores AIDB** as the storage backend. Drop-in alternative to `@openclaw/memory-lancedb` with the same auto-recall / auto-capture lifecycle, plus four SynapCores-only extensions: SQL-filtered semantic recall, graph-relation walks, AutoML relevance scoring, and a model-training helper.
 
-> **0.4.0 shipping note:** the core memory ops (`memory_store` / `memory_recall` / `memory_forget`) now ride the engine-side `MEMORY_STORE` / `MEMORY_RECALL` / `MEMORY_FORGET` primitives via `@synapcores/sdk@^0.5.0`'s `client.memory` surface. The plugin's public API (tools, CLI, extensions, types) is unchanged — only the internal storage path moved.
+> **0.5.0 shipping note:** the core memory ops (`memory_store` / `memory_recall` / `memory_forget`) ride the engine-side `MEMORY_STORE` / `MEMORY_RECALL` / `MEMORY_FORGET` primitives via `@synapcores/sdk@^0.6.0`'s `client.memory` surface. The plugin's public API (tools, CLI, extensions, types) is unchanged.
 >
 > - **Requires SynapCores gateway `v1.8.5-ce` or newer** (the version that ships the `MEMORY_*` SQL functions).
-> - **Embedding moved server-side for the hot path.** `memory_store` / `memory_recall` no longer call OpenAI — the gateway embeds via its configured model. The OpenAI client is still used by the relevance extensions (`predictRelevance`, `trainRelevanceModel`) and the `autoLinkSimilar` graph-node embedding.
+> - **Fully engine-native embeddings — zero external-LLM dependency.** The `memory_store` / `memory_recall` hot path embeds server-side inside the engine's `MEMORY_STORE` / `MEMORY_RECALL` primitives; the relevance extensions (`predictRelevance` / `trainRelevanceModel`) and the `autoLinkSimilar` graph-node embedding call the gateway's native `client.embed()`. All embeddings come from the SynapCores gateway (embedding dimension is the gateway model's, e.g. 384 for `all-minilm`). OpenAI has been removed entirely — no OpenAI key, no `openai` dependency.
 > - **Migration from 0.3.x: the engine-managed table is `_memory_<namespace>`, a different storage backend from the v0.3.x vector collection. Existing v0.3.x memories WILL NOT appear after upgrade — re-capture them.** See "Upgrading from 0.3.x" below.
 > - **`collection` config field becomes the engine `namespace`.** It must now match `^[A-Za-z_][A-Za-z0-9_]*$`. The default `openclaw_memories` continues to work; other custom values with hyphens or other non-identifier characters need updating.
-> - **`recallFiltered` WHERE clauses run engine-side** against the `MEMORY_RECALL(?, ?, ?)` result-set. The plugin auto-rewrites the four legacy column shorthands (`category`, `importance`, `createdAt`, `text`) into the JSON-extract form so most existing call sites keep working unchanged.
+> - **`recallFiltered` WHERE clauses are applied client-side.** The engine cannot apply a `WHERE` to the table-valued `MEMORY_RECALL(?, ?, ?)` result-set (it drops every row), so the plugin fetches an oversampled, unfiltered recall and evaluates the predicate in JS. Legacy column shorthands (`category`, `importance`, `createdAt`, `text`) and the JSON-extract form (`metadata->>'…'`) are both understood directly — no rewriting required.
 
 ## Upgrading from 0.3.x
 
-`@synapcores/openclaw-memory@0.4.0` is a **hard cut**: the storage backend changes, so old memories will not migrate automatically. Steps:
+`@synapcores/openclaw-memory@0.5.0` is a **hard cut** from 0.3.x: the storage backend changed (at 0.4.0), so old memories will not migrate automatically. Steps:
 
 1. Upgrade the SynapCores gateway to `v1.8.5-ce` or newer.
-2. `npm install @synapcores/openclaw-memory@0.4.0`.
+2. `npm install @synapcores/openclaw-memory@0.5.0`.
 3. If your `collection` config value contains hyphens or other non-identifier characters, rename it to match `^[A-Za-z_][A-Za-z0-9_]*$` before restarting.
 4. (Optional) export any high-value memories from the v0.3.x vector collection (the legacy `openclaw_memories` collection in your gateway) and re-store them via `memory_store` so they land in the new `_memory_<namespace>` table.
 5. (Optional) drop the old vector collection from the gateway once you're sure the export is done.
 
-If your `recallFiltered` callers use plain column names (`category`, `importance`, `createdAt`, `text`), they continue to work via auto-rewrite. Callers using the more general SQL surface should switch to the JSON-extract form (`metadata->>'…'`) directly.
+If your `recallFiltered` callers use plain column names (`category`, `importance`, `createdAt`, `text`), they continue to work — the client-side filter understands those column names directly. Callers filtering on arbitrary metadata keys use the JSON-extract form (`metadata->>'…'`).
 
 ## Why use this over `@openclaw/memory-lancedb`?
 
@@ -82,10 +82,6 @@ typically `~/.openclaw/openclaw.json`). Three things matter: the
       "memory-synapcores": {
         "enabled": true,
         "config": {
-          "embedding": {
-            "apiKey": "${OPENAI_API_KEY}",
-            "model": "text-embedding-3-small"
-          },
           "synapcores": {
             "host": "localhost",
             "port": 8080,
@@ -110,7 +106,7 @@ typically `~/.openclaw/openclaw.json`). Three things matter: the
 > **disabled**.
 
 Then `openclaw config validate`. Environment-variable interpolation
-(`${OPENAI_API_KEY}`, `${SYNAPCORES_API_KEY}`) is supported in any string field
+(`${SYNAPCORES_API_KEY}`) is supported in any string field
 so you don't have to commit secrets. (Store keys **clean** — a trailing newline
 in `apiKey` will break auth.)
 
@@ -118,8 +114,6 @@ in `apiKey` will break auth.)
 
 | Field | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `embedding.apiKey` | yes | — | OpenAI API key for the embedding model. |
-| `embedding.model` | no | `text-embedding-3-small` | Either `text-embedding-3-small` (1536 dims) or `text-embedding-3-large` (3072 dims). |
 | `synapcores.apiKey` | yes | — | SynapCores API key (`ak_prod_…` or `aidb_…`). |
 | `synapcores.host` | no | `localhost` | SynapCores gateway hostname. |
 | `synapcores.port` | no | `8080` | SynapCores gateway port. |
@@ -128,7 +122,7 @@ in `apiKey` will break auth.)
 | `graph` | no | `openclaw_memory_graph` | SynapCores graph name (used for `SIMILAR_TO` edges and `recallRelated` walks). |
 | `autoCapture` | no | `true` | Auto-store memorable utterances after each agent turn. |
 | `autoRecall` | no | `true` | Auto-inject relevant memories before each agent turn. |
-| `autoLinkSimilar` | no | `true` | On capture, insert each Memory as a graph node carrying the embedding so `recallRelated` returns useful neighborhoods out of the box. Adds ~30-80ms per capture; disable if you never call `recallRelated`. |
+| `autoLinkSimilar` | no | `true` | On capture, insert each Memory as a graph node carrying the embedding so `recallRelated` returns useful neighborhoods out of the box. Adds ~30-50ms per capture; disable if you never call `recallRelated`. |
 | `workspace` | no | — | Optional workspace suffix on the AutoML relevance model name so multiple installations sharing one gateway can train independent models. |
 
 ## What you get
@@ -149,7 +143,7 @@ Once registered, the plugin:
 | --- | --- |
 | `memory_recall` | Vector-search the memory store. Params: `{ query: string, limit?: number }` (default 5). |
 | `memory_store` | Persist a new memory. Params: `{ text, importance?, category? }`. De-dupes against >0.95 cosine similarity. |
-| `memory_forget` | Delete a memory by `memoryId` (UUID) or by `query` (auto-deletes if exactly one candidate at >0.9 similarity, otherwise returns candidates). |
+| `memory_forget` | Delete a memory by `memoryId` (engine-assigned id, e.g. `mem_…`) or by `query` (auto-deletes if exactly one candidate at >0.9 similarity, otherwise returns candidates). |
 
 ### Extensions (programmatic, SynapCores-only)
 
@@ -166,8 +160,10 @@ interface MemorySynapCoresExtensions {
 
   /** Walk SIMILAR_TO / MENTIONS / RELATES_TO edges from a memory. */
   recallRelated(memoryId: string, opts?: {
-    hops?: number;          // default 1
-    edgeKinds?: string[];   // default: any
+    hops?: number;               // default 1 (capped at 4)
+    edgeKinds?: string[];        // default: ["SIMILAR_TO"]
+    similarityThreshold?: number; // default 0.5 (synthetic SIMILAR_TO edges only)
+    limit?: number;              // default 20
   }): Promise<RelatedMemoryResult[]>;
 
   /** Score candidates with an AutoML model (with heuristic fallback). */
@@ -192,7 +188,16 @@ const results = await plugin.extensions.recallFiltered({
 });
 ```
 
-The `where` clause is forwarded to the SynapCores gateway as the `filter` field on `/vector_search`. SQL validation happens on the gateway — a malformed clause will surface as an SDK error.
+Because the engine cannot apply a `WHERE` to the table-valued `MEMORY_RECALL(?, ?, ?)` result-set, the plugin runs an oversampled unfiltered recall and evaluates the `where` predicate **client-side in JS**. A malformed clause surfaces as a descriptive `recallFiltered: …` error thrown by the plugin (not an engine error).
+
+Supported `where` surface (parsed by the plugin's predicate compiler):
+
+- **Fields:** `category`, `importance`, `createdAt`, `text` / `content`, `id`, `similarity` / `score`, and JSON-extract `metadata->>'key'` for any other metadata field.
+- **Comparison operators:** `=` / `==`, `!=` / `<>`, `>`, `>=`, `<`, `<=`, `LIKE` (SQL `%` / `_` wildcards), and `IN (…)`.
+- **Boolean combinators:** `AND`, `OR`, `NOT`, and parentheses.
+- **Literals:** single-quoted strings, numbers, `TRUE` / `FALSE` / `NULL`.
+
+An empty clause or `1=1` passes all rows. Anything outside this surface (subqueries, functions, joins) throws rather than silently returning wrong rows.
 
 #### `recallRelated` — graph neighborhood walk
 
@@ -220,8 +225,8 @@ ranked.sort((a, b) => b.relevance - a.relevance);
 When a model named `openclaw_memory_relevance[_<workspace>]` exists, candidates are scored by it. Otherwise the plugin falls back to:
 
 ```
-relevance = 0.6 * cosine_similarity(query, memory)
-          + 0.25 * exp(-age_days / 14)         # 14-day half-life
+relevance = 0.6 * (cosine_similarity(query, memory) + 1) / 2   # cosine mapped [-1,1] -> [0,1]
+          + 0.25 * exp(-age_days / 14)                          # ~14-day recency decay
           + 0.15 * memory.importance
 ```
 
@@ -239,14 +244,14 @@ await plugin.extensions.trainRelevanceModel(feedback);
 
 Requires at least 10 samples; throws otherwise. Train periodically (cron / on-demand) — the next `predictRelevance` call will detect the model and switch out of heuristic mode.
 
-Under the hood, v0.4.0 stages feedback rows in a SQL table (`openclaw_memory_relevance_training[_<workspace>]`) on the gateway, then calls `/v1/automl/train` with `target: 'score'` and `task: 'regression'`. The table is preserved across calls so feedback accumulates between sessions; clear it manually with `DROP TABLE` (via `client.executeQuery`) if you want a clean restart. Memory hydration is via `MEMORY_RECALL(?, ?, ?) WHERE id = ?` against the engine's namespace; rows whose memories have been deleted are skipped.
+Under the hood, the plugin stages feedback rows in a SQL table (`openclaw_memory_relevance_training[_<workspace>]`) on the gateway, then calls `/v1/automl/train` with `target: 'score'` and `task: 'regression'`. The table is preserved across calls so feedback accumulates between sessions; clear it manually with `DROP TABLE` (via `client.executeQuery`) if you want a clean restart. Memory hydration is via `MEMORY_RECALL(?, ?, ?) WHERE id = ?` against the engine's namespace; rows whose memories have been deleted are skipped.
 
-## Roadmap (0.5.0+)
+## Roadmap
 
 - **Entity extraction on capture** — parse `@mention` tokens and known-contact names out of incoming text and create `Person` / `Project` graph nodes with `MENTIONS` edges back to the memory.
 - **Tag inference** — auto-classify memories into a configurable tag vocabulary on capture (small classifier or LLM call) so `recallFiltered` queries can use tags out of the box.
 - **`synapcores-import-lancedb` migration script** — read an existing `~/.openclaw/memory/lancedb` store, re-embed if needed, and bulk-load into a SynapCores collection. Ships as a `bin` entry on the package.
-- **Drop the `_getHttpClient` graph-node workaround** once `@synapcores/sdk >0.4.0` fixes `client.graph.nodes.create` to post `{labels: [label]}` instead of `{label}` (the wire shape the gateway's `/v1/graph/nodes` handler expects).
+- **Drop the `_getHttpClient` graph-node / graph-match workarounds** once the SDK restores a native graph API: `client.graph.nodes.create` needs to post `{labels: [label]}` (not `{label}`) to match the gateway's `/v1/graph/nodes` handler, and `recallRelated` currently posts Cypher to `/v1/graph/match` directly because `@synapcores/sdk@^0.6.0` no longer exposes `client.graph.cypher`.
 
 ## Upstream
 
