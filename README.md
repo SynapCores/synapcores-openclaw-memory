@@ -81,6 +81,9 @@ typically `~/.openclaw/openclaw.json`). Three things matter: the
     "entries": {
       "memory-synapcores": {
         "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true
+        },
         "config": {
           "synapcores": {
             "host": "localhost",
@@ -104,6 +107,16 @@ typically `~/.openclaw/openclaw.json`). Three things matter: the
 > plugin can own the memory slot, and the default is OpenClaw's built-in
 > `memory-core` — without claiming the slot the plugin loads but stays
 > **disabled**.
+
+> **You must set `plugins.entries.memory-synapcores.hooks.allowConversationAccess`
+> to `true`.** OpenClaw gates conversation-lifecycle hooks (`before_agent_start`,
+> `agent_end`) behind this flag for any non-bundled plugin. Without it, the
+> plugin loads and its tools work, but `autoCapture`/`autoRecall` silently do
+> nothing — the gateway logs `typed hook "agent_end" blocked because
+> non-bundled plugins must set ...hooks.allowConversationAccess=true` and moves
+> on. This lives outside `configSchema` (it's an OpenClaw host-level permission,
+> not a plugin config field), so it won't show up in `openclaw config validate`
+> errors — check the gateway log if auto-capture seems inactive.
 
 Then `openclaw config validate`. Environment-variable interpolation
 (`${SYNAPCORES_API_KEY}`) is supported in any string field
