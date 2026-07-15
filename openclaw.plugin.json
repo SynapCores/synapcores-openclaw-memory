@@ -1,5 +1,6 @@
 {
   "id": "memory-synapcores",
+  "name": "Memory (SynapCores)",
   "kind": "memory",
   "commandAliases": [{ "name": "ltm" }],
   "activation": {

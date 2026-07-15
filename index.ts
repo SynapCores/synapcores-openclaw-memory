@@ -1897,9 +1897,13 @@ const memoryPlugin = {
     // Lifecycle Hooks
     // ========================================================================
 
-    // Auto-recall: inject relevant memories before agent starts
+    // Auto-recall: inject relevant memories into the prompt build.
+    // Uses the current `before_prompt_build` hook (the phase OpenClaw's own
+    // Active Memory plugin uses for recall injection). The event still carries
+    // `prompt`, and the result type (PluginHookBeforePromptBuildResult) still
+    // exposes `prependContext` — so per-turn recall injection is preserved.
     if (cfg.autoRecall) {
-      api.on("before_agent_start", async (event) => {
+      api.on("before_prompt_build", async (event) => {
         if (!event.prompt || event.prompt.length < 5) {
           return;
         }
