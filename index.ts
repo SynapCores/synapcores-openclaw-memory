@@ -2063,6 +2063,12 @@ const memoryPlugin = {
   },
 };
 
-const pluginEntry = definePluginEntry(memoryPlugin);
+// Annotate with `ReturnType<typeof definePluginEntry>` (the DefinedPluginEntry
+// shape) so the emitted declaration references only the public, importable
+// `definePluginEntry` symbol instead of an internal openclaw module path.
+// Without this, tsc emits TS2742 because the inferred type points at
+// `openclaw/dist/types-*.js`, which is not a portable/nameable reference.
+const pluginEntry: ReturnType<typeof definePluginEntry> =
+  definePluginEntry(memoryPlugin);
 
 export default pluginEntry;
