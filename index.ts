@@ -1744,10 +1744,20 @@ const memoryPlugin = {
     });
 
     // Same official mechanism OpenClaw's bundled memory-core plugin uses —
-    // the runtime calls this right before the session auto-compacts.
-    api.registerMemoryCapability({
-      flushPlanResolver: buildMemoryFlushPlan,
-    });
+    // the runtime calls this right before the session auto-compacts. Guarded:
+    // older hosts (pre-dating this API) would otherwise crash the entire
+    // register() call — and with it every tool below — over one optional
+    // capability. Missing it just means no pre-compaction flush; everything
+    // else still works.
+    if (typeof api.registerMemoryCapability === "function") {
+      api.registerMemoryCapability({
+        flushPlanResolver: buildMemoryFlushPlan,
+      });
+    } else {
+      api.logger.debug?.(
+        "memory-synapcores: host does not support registerMemoryCapability; skipping pre-compaction flush",
+      );
+    }
 
     const db = new MemoryDB(client, namespace);
     const embeddings = new Embeddings(client);

@@ -144,9 +144,16 @@ Once registered, the plugin:
 
 1. Exposes three OpenClaw **tools** to your agents: `memory_recall`, `memory_store`, `memory_forget`.
 2. Adds a CLI sub-command `openclaw ltm {list,search,stats}`.
-3. Hooks `before_agent_start` to auto-recall relevant memories (if `autoRecall: true`).
-4. Hooks `agent_end` to auto-capture preferences / decisions / entities / facts (if `autoCapture: true`).
-5. Exposes four SynapCores-only methods at `plugin.extensions.*` (see "Extensions" below).
+3. Hooks `before_prompt_build` to auto-recall relevant memories (if `autoRecall: true`).
+4. Hooks `agent_end` to auto-capture preferences / decisions / entities / facts matching a rule-based
+   trigger list (if `autoCapture: true`) — a fast, per-turn safety net, not exhaustive by design.
+5. Registers a `registerMemoryCapability` flush plan — the same mechanism OpenClaw's own bundled
+   `memory-core` plugin uses. Right before a session auto-compacts, the core runtime prompts the
+   agent to call `memory_store` for anything durable that's about to fall out of context, in its
+   own words. This runs independently of `autoCapture` and catches things the per-turn trigger
+   list misses. No config needed — registered automatically whenever the plugin loads on a host
+   that supports it (silently skipped on older hosts).
+6. Exposes four SynapCores-only methods at `plugin.extensions.*` (see "Extensions" below).
 
 ## API reference
 

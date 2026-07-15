@@ -1004,6 +1004,19 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     expect(typeof plan.relativePath).toBe("string");
   });
 
+  test("does not crash on hosts without registerMemoryCapability (older OpenClaw versions)", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: false });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    delete (mockApi as any).registerMemoryCapability;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(() => memoryPlugin.register(mockApi as any)).not.toThrow();
+    // The rest of registration (tools, etc.) must still complete normally —
+    // this is the whole point of the guard.
+    expect(registeredTools.length).toBe(3);
+  });
+
   test("recallFiltered runs the WHERE clause engine-side against MEMORY_RECALL output (legacy shorthand auto-rewrites)", async () => {
     const { default: memoryPlugin } = await import("./index.js");
     const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: false });
