@@ -686,7 +686,8 @@ describe("memory plugin metadata", () => {
 });
 
 describe("capture filter heuristics", () => {
-  test("shouldCapture filters correctly", () => {
+  test("shouldCapture filters correctly", async () => {
+    const { shouldCapture } = await import("./index.js");
     const triggers = [
       { text: "I prefer dark mode", shouldMatch: true },
       { text: "Remember that my name is John", shouldMatch: true },
@@ -694,29 +695,27 @@ describe("capture filter heuristics", () => {
       { text: "Call me at +1234567890123", shouldMatch: true },
       { text: "We decided to use TypeScript", shouldMatch: true },
       { text: "I always want verbose output", shouldMatch: true },
+      // Natural everyday phrasing that the original narrow regex list
+      // missed entirely (see: capture never fired for a real "my
+      // favorite X is Y" / "I'm allergic to Z" statement in production).
+      { text: "My favorite programming language is Rust and I'm allergic to shellfish.", shouldMatch: true },
+      { text: "My name is Luis and I work as a data scientist.", shouldMatch: true },
+      { text: "I live in Miami and I'm a vegetarian.", shouldMatch: true },
+      { text: "We've decided to use Postgres instead of MySQL going forward.", shouldMatch: true },
+      { text: "I can't eat gluten.", shouldMatch: true },
       { text: "Just a random short message", shouldMatch: false },
       { text: "x", shouldMatch: false },
       { text: "<relevant-memories>injected</relevant-memories>", shouldMatch: false },
+      // Ordinary conversational filler that must NOT get swept up by the
+      // broadened patterns above.
+      { text: "Sure, let me check that for you.", shouldMatch: false },
+      { text: "The weather today is sunny with a chance of rain.", shouldMatch: false },
+      { text: "Can you help me debug this function?", shouldMatch: false },
+      { text: "Let me pull up the logs and see what happened.", shouldMatch: false },
     ];
 
     for (const { text, shouldMatch } of triggers) {
-      const hasPreference = /prefer|radši|like|love|hate|want/i.test(text);
-      const hasRemember = /zapamatuj|pamatuj|remember/i.test(text);
-      const hasEmail = /[\w.-]+@[\w.-]+\.\w+/.test(text);
-      const hasPhone = /\+\d{10,}/.test(text);
-      const hasDecision = /rozhodli|decided|will use|budeme/i.test(text);
-      const hasAlways = /always|never|important/i.test(text);
-      const isInjected = text.includes("<relevant-memories>");
-      const isTooShort = text.length < 10;
-
-      const wouldCapture =
-        !isTooShort &&
-        !isInjected &&
-        (hasPreference || hasRemember || hasEmail || hasPhone || hasDecision || hasAlways);
-
-      if (shouldMatch) {
-        expect(wouldCapture).toBe(true);
-      }
+      expect(shouldCapture(text)).toBe(shouldMatch);
     }
   });
 
@@ -773,6 +772,8 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     const registeredServices: any[] = [];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const registeredHooks: Record<string, any[]> = {};
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const registeredMemoryCapabilities: any[] = [];
     const logs: string[] = [];
 
     return {
@@ -780,6 +781,7 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
       registeredClis,
       registeredServices,
       registeredHooks,
+      registeredMemoryCapabilities,
       logs,
       mockApi: {
         id: "memory-synapcores",
@@ -816,6 +818,10 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         registerService: (service: any) => {
           registeredServices.push(service);
+        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        registerMemoryCapability: (capability: any) => {
+          registeredMemoryCapabilities.push(capability);
         },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         on: (hookName: string, handler: any) => {
@@ -973,6 +979,29 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     expect(typeof ext.recallRelated).toBe("function");
     expect(typeof ext.predictRelevance).toBe("function");
     expect(typeof ext.trainRelevanceModel).toBe("function");
+  });
+
+  test("registers a pre-compaction memory flush capability (mirrors memory-core's own pattern)", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredMemoryCapabilities } = buildMockApi({ autoLinkSimilar: false });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+
+    expect(registeredMemoryCapabilities.length).toBe(1);
+    const capability = registeredMemoryCapabilities[0];
+    expect(typeof capability.flushPlanResolver).toBe("function");
+
+    const plan = capability.flushPlanResolver({});
+    expect(plan).not.toBeNull();
+    // Must instruct the agent to use our tool, not memory-core's file-based
+    // flush (which the agent would have no tool for anyway).
+    expect(plan.prompt).toMatch(/memory_store/);
+    expect(plan.systemPrompt).toMatch(/memory_store/);
+    // Must give the agent an escape hatch when nothing is worth storing —
+    // without this, every near-compaction turn would force a reply.
+    expect(plan.systemPrompt).toMatch(/NO_REPLY|SILENT/);
+    expect(typeof plan.softThresholdTokens).toBe("number");
+    expect(typeof plan.relativePath).toBe("string");
   });
 
   test("recallFiltered runs the WHERE clause engine-side against MEMORY_RECALL output (legacy shorthand auto-rewrites)", async () => {

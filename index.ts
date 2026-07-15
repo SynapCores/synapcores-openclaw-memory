@@ -19,10 +19,12 @@
  * `client.memory` surface. Requires SynapCores gateway v1.8.5-ce+.
  */
 
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
+import type { OpenClawPluginApi, OpenClawPluginDefinition } from "openclaw/plugin-sdk/core";
 import { Type } from "typebox";
 import { stringEnum } from "openclaw/plugin-sdk/core";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import { SILENT_REPLY_TOKEN } from "openclaw/plugin-sdk/memory-core";
+import type { MemoryFlushPlan } from "openclaw/plugin-sdk/memory-core";
 import { SynapCores } from "@synapcores/sdk";
 import type { MemoryRecord } from "@synapcores/sdk";
 import {
@@ -983,12 +985,62 @@ const MEMORY_TRIGGERS = [
   /\+\d{10,}/,
   /[\w.-]+@[\w.-]+\.\w+/,
   /můj\s+\w+\s+je|je\s+můj/i,
-  /my\s+\w+\s+is|is\s+my/i,
-  /i (like|prefer|hate|love|want|need)/i,
+  // "my favorite programming language is Rust" — allow any number of words
+  // between "my" and "is/are", not just a single token.
+  /\bmy\s+(?:\w+\s+){0,5}(?:is|are|was|were)\b|\bis\s+my\b/i,
+  /i\s?'?\s?(?:like|prefer|hate|love|want|need|enjoy|dislike|avoid)/i,
+  // constraints/restrictions: allergic to, can't eat, don't eat, no dairy, etc.
+  /allerg(?:y|ic)|intoleran(?:ce|t)|can'?t (?:eat|have|drink)|don'?t (?:eat|drink)/i,
+  // identity/context facts — deliberately specific, not a bare "i'm \w+"
+  // (which would match almost every sentence and flood memory with junk)
+  /my name is|call me|i work (?:at|for|as)|i live in|i'?m based in|i was born|i'?m (?:a|an)\s+\w+/i,
+  // decisions/commitments
+  /decided (?:to|that)|will use|we'?ll (?:use|go with|switch to)|going forward/i,
+  // explicit remember requests
+  /remember that|note that|for future reference|keep in mind|fyi\b/i,
   /always|never|important/i,
 ];
 
-function shouldCapture(text: string): boolean {
+/** Extracts plain-text user/assistant turns from a session's `unknown[]` message log. */
+function extractMessageTexts(messages: unknown[]): string[] {
+  const texts: string[] = [];
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") {
+      continue;
+    }
+    const msgObj = msg as Record<string, unknown>;
+
+    const role = msgObj.role;
+    if (role !== "user" && role !== "assistant") {
+      continue;
+    }
+
+    const content = msgObj.content;
+
+    if (typeof content === "string") {
+      texts.push(content);
+      continue;
+    }
+
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (
+          block &&
+          typeof block === "object" &&
+          "type" in block &&
+          (block as Record<string, unknown>).type === "text" &&
+          "text" in block &&
+          typeof (block as Record<string, unknown>).text === "string"
+        ) {
+          texts.push((block as Record<string, unknown>).text as string);
+        }
+      }
+    }
+  }
+  return texts;
+}
+
+export function shouldCapture(text: string): boolean {
   if (text.length < 10 || text.length > 500) {
     return false;
   }
@@ -1010,6 +1062,53 @@ function shouldCapture(text: string): boolean {
     return false;
   }
   return MEMORY_TRIGGERS.some((r) => r.test(text));
+}
+
+// ============================================================================
+// Memory capability: pre-compaction flush
+//
+// Mirrors OpenClaw's own bundled `memory-core` plugin, which does not rely on
+// per-turn regex scanning at all — it registers a `flushPlanResolver` that the
+// core runtime calls right before a session auto-compacts, spinning up a
+// dedicated "flush" turn that asks the agent itself to write down whatever's
+// worth keeping, in its own words, before older context gets discarded.
+//
+// memory-core's version tells the agent to append to a dated markdown file
+// (it owns file-backed storage). We don't — SynapCores is the store — so our
+// flush prompt tells the agent to call `memory_store` instead. `relativePath`
+// is a required field of MemoryFlushPlan but is only ever used by memory-core
+// to template its own file-path prompt text; we don't write files, so it's a
+// label only, not a real path.
+// ============================================================================
+
+const MEMORY_FLUSH_SYSTEM_PROMPT = [
+  "Pre-compaction memory flush turn.",
+  "This session is about to auto-compact and older context will be discarded.",
+  "Review the conversation and call the memory_store tool once per distinct " +
+    "durable fact, preference, decision, or constraint worth keeping — in your " +
+    "own words, not a verbatim transcript quote.",
+  "Do not call memory_store for anything already covered by an existing memory; " +
+    "use memory_recall first if you're unsure whether something is already stored.",
+  "Do not answer the user during this turn.",
+  `If there is nothing worth storing, reply with exactly ${SILENT_REPLY_TOKEN} and call no tools.`,
+].join(" ");
+
+const MEMORY_FLUSH_PROMPT = [
+  "Pre-compaction memory flush.",
+  "Store any durable facts, preferences, decisions, or constraints from this " +
+    "conversation via memory_store, one call per fact.",
+  `If nothing is worth storing, reply with exactly ${SILENT_REPLY_TOKEN}.`,
+].join(" ");
+
+function buildMemoryFlushPlan(): MemoryFlushPlan | null {
+  return {
+    softThresholdTokens: 4000,
+    forceFlushTranscriptBytes: 2 * 1024 * 1024,
+    reserveTokensFloor: 20000,
+    prompt: MEMORY_FLUSH_PROMPT,
+    systemPrompt: MEMORY_FLUSH_SYSTEM_PROMPT,
+    relativePath: "synapcores-memory-flush",
+  };
 }
 
 function detectCategory(text: string): MemoryCategory {
@@ -1643,6 +1742,13 @@ const memoryPlugin = {
       useHttps: cfg.synapcores.useHttps,
       apiKey: cfg.synapcores.apiKey,
     });
+
+    // Same official mechanism OpenClaw's bundled memory-core plugin uses —
+    // the runtime calls this right before the session auto-compacts.
+    api.registerMemoryCapability({
+      flushPlanResolver: buildMemoryFlushPlan,
+    });
+
     const db = new MemoryDB(client, namespace);
     const embeddings = new Embeddings(client);
     const extensions = createExtensions(
@@ -1667,7 +1773,10 @@ const memoryPlugin = {
         name: "memory_recall",
         label: "Memory Recall",
         description:
-          "Search through long-term memories. Use when you need context about user preferences, past decisions, or previously discussed topics.",
+          "Search through long-term memories from past conversations. Call this proactively " +
+          "at the start of a conversation or whenever the user references something that " +
+          "sounds like it was established before (a preference, a name, a past decision, " +
+          "a constraint like an allergy) — don't wait to be asked \"do you remember\".",
         parameters: Type.Object({
           query: Type.String({ description: "Search query" }),
           limit: Type.Optional(Type.Number({ description: "Max results (default: 5)" })),
@@ -1713,7 +1822,13 @@ const memoryPlugin = {
         name: "memory_store",
         label: "Memory Store",
         description:
-          "Save important information in long-term memory. Use for preferences, facts, decisions.",
+          "Save durable information to long-term memory, in your own words. Call this " +
+          "proactively — don't wait to be told to remember something. Store it whenever the " +
+          "user states: a personal preference or opinion (favorite/likes/dislikes/prefers), " +
+          "an identifying fact (name, job, location, relationships), a constraint that affects " +
+          "future answers (allergy, restriction, accessibility need), or a decision/commitment " +
+          "made during the conversation. When in doubt about whether something is worth " +
+          "remembering, store it — the cost of a missed memory is higher than an extra one.",
         parameters: Type.Object({
           text: Type.String({ description: "Information to remember" }),
           importance: Type.Optional(Type.Number({ description: "Importance 0-1 (default: 0.7)" })),
@@ -1938,41 +2053,7 @@ const memoryPlugin = {
         }
 
         try {
-          // Extract text content from messages (handling unknown[] type)
-          const texts: string[] = [];
-          for (const msg of event.messages) {
-            if (!msg || typeof msg !== "object") {
-              continue;
-            }
-            const msgObj = msg as Record<string, unknown>;
-
-            const role = msgObj.role;
-            if (role !== "user" && role !== "assistant") {
-              continue;
-            }
-
-            const content = msgObj.content;
-
-            if (typeof content === "string") {
-              texts.push(content);
-              continue;
-            }
-
-            if (Array.isArray(content)) {
-              for (const block of content) {
-                if (
-                  block &&
-                  typeof block === "object" &&
-                  "type" in block &&
-                  (block as Record<string, unknown>).type === "text" &&
-                  "text" in block &&
-                  typeof (block as Record<string, unknown>).text === "string"
-                ) {
-                  texts.push((block as Record<string, unknown>).text as string);
-                }
-              }
-            }
-          }
+          const texts = extractMessageTexts(event.messages);
 
           // Filter for capturable content
           const toCapture = texts.filter((text) => text && shouldCapture(text));
@@ -2063,6 +2144,6 @@ const memoryPlugin = {
   },
 };
 
-const pluginEntry = definePluginEntry(memoryPlugin);
+const pluginEntry: OpenClawPluginDefinition = definePluginEntry(memoryPlugin);
 
 export default pluginEntry;
