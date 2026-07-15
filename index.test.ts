@@ -17,10 +17,11 @@
 
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "test-key";
 const SYNAPCORES_API_KEY = process.env.SYNAPCORES_API_KEY ?? "ak_prod_test_key";
-const HAS_OPENAI_KEY = Boolean(process.env.OPENAI_API_KEY);
-const liveEnabled = HAS_OPENAI_KEY && process.env.OPENCLAW_LIVE_TEST === "1";
+// Embeddings are engine-native (client.embed()); no external embedding
+// provider key is required. Live tests only need a running gateway + API key.
+const HAS_SYNAPCORES_KEY = Boolean(process.env.SYNAPCORES_API_KEY);
+const liveEnabled = HAS_SYNAPCORES_KEY && process.env.OPENCLAW_LIVE_TEST === "1";
 const describeLive = liveEnabled ? describe : describe.skip;
 
 // ---------------------------------------------------------------------------
@@ -308,6 +309,13 @@ class FakeSynapCores {
     this.memory = new FakeMemoryClient(this);
   }
 
+  // Engine-native embedding surface (SDK 0.6.0 `client.embed()`). The plugin's
+  // `Embeddings` wrapper calls this; we return deterministic token-based
+  // vectors so cosine similarity is stable across store/recall/relevance.
+  async embed(text: string): Promise<number[]> {
+    return deterministicEmbed(text);
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async executeQuery(req: { sql: string; parameters?: any[] }): Promise<any> {
     this.sqlCalls.push(req);
@@ -573,26 +581,11 @@ function getLastFake(): FakeSynapCores {
   return mockState.lastFake as FakeSynapCores;
 }
 
-// Mock OpenAI embeddings to return deterministic, token-based vectors so
-// that semantically-similar texts (texts that share tokens) get high cosine
-// similarity. Each token hashes into a primary + two secondary buckets out
-// of a 1536-dim sparse vector. This means:
-//   - identical text -> cosine 1.0
-//   - "a b c d e" vs "a b c d e f" -> cosine ~0.94
-//   - texts sharing no tokens -> cosine 0
-vi.mock("openai", () => {
-  return {
-    default: class OpenAIMock {
-      embeddings = {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        create: async ({ input }: { input: string | string[] }): Promise<any> => {
-          const text = Array.isArray(input) ? input[0] : input;
-          return { data: [{ embedding: deterministicEmbed(text) }] };
-        },
-      };
-    },
-  };
-});
+// OpenAI has been fully removed from the plugin — embeddings are engine-native
+// via `client.embed()` (the fake `FakeSynapCores.embed` above returns the same
+// deterministic, token-based vectors so semantically-similar texts get high
+// cosine similarity: identical text -> 1.0, shared-token texts -> ~0.94,
+// disjoint texts -> 0). No `vi.mock("openai")` is needed anymore.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -614,10 +607,6 @@ describe("memory plugin metadata", () => {
     const { default: memoryPlugin } = await import("./index.js");
 
     const config = memoryPlugin.configSchema?.parse?.({
-      embedding: {
-        apiKey: OPENAI_API_KEY,
-        model: "text-embedding-3-small",
-      },
       synapcores: {
         host: "localhost",
         port: 8080,
@@ -632,7 +621,7 @@ describe("memory plugin metadata", () => {
     });
 
     expect(config).toBeDefined();
-    expect(config?.embedding?.apiKey).toBe(OPENAI_API_KEY);
+    expect(config?.synapcores?.apiKey).toBe(SYNAPCORES_API_KEY);
     expect(config?.synapcores?.host).toBe("localhost");
     expect(config?.synapcores?.port).toBe(8080);
     expect(config?.collection).toBe("openclaw_memories");
@@ -643,30 +632,28 @@ describe("memory plugin metadata", () => {
   test("config schema resolves env vars", async () => {
     const { default: memoryPlugin } = await import("./index.js");
 
-    process.env.TEST_MEMORY_API_KEY = "test-key-123";
     process.env.TEST_SC_API_KEY = "ak_prod_test_456";
 
     const config = memoryPlugin.configSchema?.parse?.({
-      embedding: { apiKey: "${TEST_MEMORY_API_KEY}" },
       synapcores: { apiKey: "${TEST_SC_API_KEY}" },
     });
 
-    expect(config?.embedding?.apiKey).toBe("test-key-123");
     expect(config?.synapcores?.apiKey).toBe("ak_prod_test_456");
 
-    delete process.env.TEST_MEMORY_API_KEY;
     delete process.env.TEST_SC_API_KEY;
   });
 
-  test("config schema rejects missing embedding apiKey", async () => {
+  test("config schema rejects an unknown top-level key (OpenAI embedding block removed)", async () => {
     const { default: memoryPlugin } = await import("./index.js");
 
     expect(() => {
       memoryPlugin.configSchema?.parse?.({
-        embedding: {},
+        // `embedding` was removed when OpenAI was dropped — it is now an
+        // unknown key and must be rejected.
+        embedding: { apiKey: "test-key" },
         synapcores: { apiKey: SYNAPCORES_API_KEY },
       });
-    }).toThrow("embedding.apiKey is required");
+    }).toThrow("unknown keys: embedding");
   });
 
   test("config schema rejects missing synapcores apiKey", async () => {
@@ -674,7 +661,6 @@ describe("memory plugin metadata", () => {
 
     expect(() => {
       memoryPlugin.configSchema?.parse?.({
-        embedding: { apiKey: OPENAI_API_KEY },
         synapcores: {},
       });
     }).toThrow("synapcores.apiKey is required");
@@ -684,7 +670,6 @@ describe("memory plugin metadata", () => {
     const { default: memoryPlugin } = await import("./index.js");
 
     const config = memoryPlugin.configSchema?.parse?.({
-      embedding: { apiKey: OPENAI_API_KEY },
       synapcores: { apiKey: SYNAPCORES_API_KEY },
     });
 
@@ -802,10 +787,6 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
         source: "test",
         config: {},
         pluginConfig: {
-          embedding: {
-            apiKey: OPENAI_API_KEY,
-            model: "text-embedding-3-small",
-          },
           synapcores: {
             host: "localhost",
             port: 8080,
@@ -1025,16 +1006,44 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
       expect(r.entry.category).toBe("preference");
     }
 
-    // The plugin emits MEMORY_RECALL via executeQuery; the legacy bare
-    // `category` identifier should have been rewritten into the JSON-extract
-    // form by `rewriteLegacyWhere` before submission.
+    // ENGINE-BUG WORKAROUND: applying a `WHERE metadata->>'…'` predicate to the
+    // table-valued MEMORY_RECALL(...) output makes the gateway return 0 rows +
+    // an empty column set, so the plugin no longer emits a WHERE clause. It
+    // fetches an unfiltered, oversampled MEMORY_RECALL and applies the predicate
+    // client-side (compileWherePredicate). Assert the emitted SQL is WHERE-free.
     const fake = getLastFake();
     const memCalls = fake.sqlCalls.filter((c) => /MEMORY_RECALL/.test(c.sql));
     expect(memCalls.length).toBeGreaterThan(0);
-    expect(memCalls[0].sql).toMatch(/metadata->>'category'/);
+    expect(memCalls[0].sql).not.toMatch(/\bWHERE\b/i);
+    expect(memCalls[0].sql).toMatch(/FROM MEMORY_RECALL\(\$1, \$2, \$3\)\s+LIMIT/);
   });
 
-  test("recallFiltered with where '1=1' falls through to a plain MEMORY_RECALL call", async () => {
+  test("recallFiltered applies a compound category+importance predicate client-side (step-3 scenario)", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: false });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ext = (memoryPlugin as any).extensions;
+    const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")?.tool;
+    // Two preferences: one above and one below the importance threshold, plus a
+    // decision that must be excluded by the category clause.
+    await storeTool.execute("c1", { text: "I prefer dark mode everywhere", importance: 0.9, category: "preference" });
+    await storeTool.execute("c2", { text: "I sometimes like verbose logs", importance: 0.5, category: "preference" });
+    await storeTool.execute("c3", { text: "We chose TypeScript for the project", importance: 0.8, category: "decision" });
+
+    const results = await ext.recallFiltered({
+      where: "category = 'preference' AND importance >= 0.7",
+      semantic: "what UI does the user like?",
+      limit: 5,
+    });
+    // Only c1 satisfies BOTH the category and the numeric importance predicate.
+    expect(results.length).toBe(1);
+    expect(results[0].entry.category).toBe("preference");
+    expect(results[0].entry.importance).toBeGreaterThanOrEqual(0.7);
+  });
+
+  test("recallFiltered with where '1=1' emits a plain (WHERE-free) MEMORY_RECALL and passes all rows", async () => {
     const { default: memoryPlugin } = await import("./index.js");
     const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: false });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1053,10 +1062,11 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     const fake = getLastFake();
     const memCalls = fake.sqlCalls.filter((c) => /MEMORY_RECALL/.test(c.sql));
     expect(memCalls.length).toBeGreaterThan(0);
-    expect(memCalls[0].sql).toMatch(/WHERE 1=1/);
+    // `1=1` short-circuits to pass-all client-side; SQL carries no WHERE.
+    expect(memCalls[0].sql).not.toMatch(/\bWHERE\b/i);
   });
 
-  test("capture inserts a Memory graph node when autoLinkSimilar=true (embedded via OpenAI)", async () => {
+  test("capture inserts a Memory graph node when autoLinkSimilar=true (engine-native embedding)", async () => {
     // The graph node is the v0.3.0/v0.4.0 hand-off point that makes
     // recallRelated work. The plugin still writes it via _getHttpClient
     // because the SDK's graph.nodes.create still uses the wrong wire shape.
@@ -1380,8 +1390,9 @@ describe("escapeCypherString", () => {
   });
 });
 
-// Live tests that require OpenAI + a running SynapCores gateway.
-// Enable with: OPENCLAW_LIVE_TEST=1 OPENAI_API_KEY=... SYNAPCORES_API_KEY=... pnpm test
+// Live tests that require a running SynapCores gateway (embeddings are
+// engine-native — no external embedding provider key needed).
+// Enable with: OPENCLAW_LIVE_TEST=1 SYNAPCORES_API_KEY=... pnpm test
 describeLive("memory plugin live tests", () => {
   test("smoke: registers against real SynapCores gateway", async () => {
     expect(true).toBe(true);

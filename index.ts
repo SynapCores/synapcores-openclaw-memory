@@ -3,10 +3,11 @@
  *
  * Long-term memory with vector search for AI conversations.
  * Uses SynapCores AIDB for storage via the engine-side
- * `MEMORY_STORE` / `MEMORY_RECALL` / `MEMORY_FORGET` primitives and
- * OpenAI for the relevance-extension features that still need a
- * client-side embedding (cosine feature in `predictRelevance`,
- * graph-node embedding when `autoLinkSimilar` is on).
+ * `MEMORY_STORE` / `MEMORY_RECALL` / `MEMORY_FORGET` primitives, and the
+ * engine-native `client.embed()` for the relevance-extension features that
+ * need a client-side embedding (cosine feature in `predictRelevance`,
+ * graph-node embedding when `autoLinkSimilar` is on). No external
+ * embedding provider is required.
  *
  * Provides seamless auto-recall and auto-capture via lifecycle hooks,
  * plus four SynapCores-only extensions (SQL-filtered recall, graph-relation
@@ -20,7 +21,6 @@
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { Type } from "typebox";
-import OpenAI from "openai";
 import { stringEnum } from "openclaw/plugin-sdk/core";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { SynapCores } from "@synapcores/sdk";
@@ -29,7 +29,6 @@ import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
   memoryConfigSchema,
-  vectorDimsForModel,
 } from "./config.js";
 
 // ============================================================================
@@ -349,17 +348,28 @@ class MemoryDB {
   }
 
   /**
-   * SQL-filtered recall. v0.4.0 forwards the WHERE clause through to a
-   * `SELECT … FROM MEMORY_RECALL(?, ?, ?) WHERE <where>` query so the
-   * filter runs engine-side over the recall result-set.
+   * SQL-filtered recall: a semantic vector search paired with a `WHERE`
+   * predicate over category / importance / createdAt / text / `metadata->>'…'`.
    *
-   * Legacy shorthand: callers wrote v0.3.x filters like
-   * `category = 'preference' AND importance >= 0.7`. v0.4.0 stores those
-   * fields inside the JSON `metadata` column, so the bare-identifier form
-   * would no longer resolve. We rewrite the four well-known shorthands
-   * (`category`, `importance`, `createdAt`, `text`) to their JSON-extract
-   * form on the way in so most existing callers keep working unchanged.
-   * Callers that already use `metadata->>'…'` get a no-op.
+   * ENGINE BUG (SynapCores gateway, confirmed v1.6.5.2-ce … v1.9.x-ce):
+   * applying ANY `WHERE` to the table-valued `MEMORY_RECALL(?, ?, ?)`
+   * function drops every row and returns an empty column set — even a bare
+   * `WHERE metadata->>'category' = 'preference'`. The engine cannot filter a
+   * table-valued-function result-set in the same SELECT. See the repro in the
+   * revalidation report; this needs an engine-side fix (planner should push
+   * the predicate as a post-filter over the TVF output, or materialize the
+   * TVF before applying WHERE).
+   *
+   * WORKAROUND (this method): fetch an oversampled, UNFILTERED
+   * `SELECT … FROM MEMORY_RECALL(?, ?, ?)` and apply the WHERE predicate
+   * CLIENT-SIDE in JS (see {@link compileWherePredicate}). The predicate
+   * evaluates against the recall row's category / importance / createdAt /
+   * text / id / similarity and its parsed `metadata` blob, so the documented
+   * filtering surface works despite the engine gap. Once the engine bug is
+   * fixed this can revert to a single WHERE-bearing SQL statement.
+   *
+   * Legacy shorthand (`category`, `importance`, `createdAt`, `text`) and the
+   * portable `metadata->>'…'` JSON-extract form are both accepted.
    */
   async searchFiltered(
     semantic: string,
@@ -367,12 +377,11 @@ class MemoryDB {
     limit = 5,
   ): Promise<MemorySearchResult[]> {
     await this.ensureReady();
-    // Oversample so the post-filter still has enough rows to return.
+    // Oversample so the client-side post-filter still has enough rows to return.
     const oversample = clampTopK(Math.max(limit * 5, 25));
-    const rewritten = rewriteLegacyWhere(where);
     const sql =
       "SELECT id, content, similarity, metadata, created_at " +
-      `FROM MEMORY_RECALL($1, $2, $3) WHERE ${rewritten} LIMIT ${Number(limit)}`;
+      `FROM MEMORY_RECALL($1, $2, $3) LIMIT ${oversample}`;
     let result;
     try {
       result = await this.client.executeQuery({
@@ -386,7 +395,11 @@ class MemoryDB {
       }
       throw err;
     }
-    return mapRecallRows(result);
+    const predicate = compileWherePredicate(where);
+    const filtered = mapRecallRowsRich(result).filter((r) =>
+      predicate({ entry: r.result.entry, score: r.result.score, metadata: r.metadata }),
+    );
+    return filtered.slice(0, Number(limit)).map((r) => r.result);
   }
 
   async delete(id: string): Promise<boolean> {
@@ -517,6 +530,19 @@ function mapRecallRows(result: {
   columns?: Array<{ name?: string } | string>;
   rows?: unknown[][];
 }): MemorySearchResult[] {
+  return mapRecallRowsRich(result).map((r) => r.result);
+}
+
+/**
+ * Like {@link mapRecallRows}, but also surfaces the parsed `metadata` blob
+ * alongside each result. Used by `searchFiltered` so the WHERE clause can be
+ * evaluated client-side against the full metadata object (see
+ * {@link compileWherePredicate} and the ENGINE-BUG note on `searchFiltered`).
+ */
+function mapRecallRowsRich(result: {
+  columns?: Array<{ name?: string } | string>;
+  rows?: unknown[][];
+}): Array<{ result: MemorySearchResult; metadata: Record<string, unknown> | null }> {
   const cols = (result.columns ?? []).map((c) =>
     typeof c === "string" ? c : (c?.name ?? ""),
   );
@@ -528,7 +554,10 @@ function mapRecallRows(result: {
   const createdIdx = colIndex("created_at");
 
   const rows = result.rows ?? [];
-  const out: MemorySearchResult[] = [];
+  const out: Array<{
+    result: MemorySearchResult;
+    metadata: Record<string, unknown> | null;
+  }> = [];
   for (const row of rows) {
     if (!Array.isArray(row)) continue;
     const meta = parseMetadataValue(metaIdx >= 0 ? row[metaIdx] : undefined);
@@ -540,19 +569,22 @@ function mapRecallRows(result: {
     const id = idIdx >= 0 ? String(row[idIdx] ?? "") : "";
     const content = contentIdx >= 0 ? String(row[contentIdx] ?? "") : "";
     out.push({
-      entry: {
-        id,
-        text: content,
-        vector: [],
-        importance: typeof importance === "number" ? importance : 0,
-        category: (typeof category === "string"
-          ? (category as MemoryCategory)
-          : "other") as MemoryCategory,
-        createdAt: typeof metadataField(meta, "createdAt") === "number"
-          ? (metadataField(meta, "createdAt") as number)
-          : createdAtMs,
+      result: {
+        entry: {
+          id,
+          text: content,
+          vector: [],
+          importance: typeof importance === "number" ? importance : 0,
+          category: (typeof category === "string"
+            ? (category as MemoryCategory)
+            : "other") as MemoryCategory,
+          createdAt: typeof metadataField(meta, "createdAt") === "number"
+            ? (metadataField(meta, "createdAt") as number)
+            : createdAtMs,
+        },
+        score: clamp01(similarity),
       },
-      score: clamp01(similarity),
+      metadata: meta,
     });
   }
   return out;
@@ -614,64 +646,254 @@ function isMissingNamespaceError(err: unknown): boolean {
 }
 
 /**
- * Rewrite a handful of legacy column-name shorthands into the JSON-extract
- * form expected against `MEMORY_RECALL`'s output schema. This is best-
- * effort and intentionally limited — callers writing complex SQL should
- * use the engine-native syntax directly.
- *
- * Rewrites:
- *   category    -> metadata->>'category'
- *   importance  -> CAST(metadata->>'importance' AS REAL)
- *   createdAt   -> CAST(metadata->>'createdAt' AS INTEGER)
- *   text        -> content
- *
- * Identifiers preceded by a dot (e.g. `m.category`) or wrapped in quotes
- * are left untouched.
+ * A record the client-side WHERE predicate evaluates against — the mapped
+ * recall result plus its parsed `metadata` blob.
  */
-function rewriteLegacyWhere(where: string): string {
-  const rules: Array<[RegExp, string]> = [
-    [/(?<![.'"\w])category(?![\w])/g, "metadata->>'category'"],
-    [/(?<![.'"\w])importance(?![\w])/g, "CAST(metadata->>'importance' AS REAL)"],
-    [/(?<![.'"\w])createdAt(?![\w])/g, "CAST(metadata->>'createdAt' AS INTEGER)"],
-    [/(?<![.'"\w])text(?![\w])/g, "content"],
-  ];
-  let out = where;
-  for (const [re, repl] of rules) {
-    out = out.replace(re, repl);
+type WhereRecord = {
+  entry: MemoryEntry;
+  score: number;
+  metadata: Record<string, unknown> | null;
+};
+
+/**
+ * Compile a SQL-ish `WHERE` fragment into a JS predicate over a
+ * {@link WhereRecord}. This exists because the engine cannot apply a `WHERE`
+ * to the table-valued `MEMORY_RECALL(...)` output (see the ENGINE BUG note on
+ * `searchFiltered`), so `searchFiltered` fetches unfiltered rows and filters
+ * them here.
+ *
+ * Supported surface (the plugin's documented filtering contract):
+ *   - Fields: `category`, `importance`, `createdAt`, `text`/`content`, `id`,
+ *     `similarity`/`score`, and JSON-extract `metadata->>'key'`.
+ *   - Comparison ops: `=`/`==`, `!=`/`<>`, `>`, `>=`, `<`, `<=`, `LIKE`
+ *     (SQL `%`/`_` wildcards), `IN (...)`.
+ *   - Boolean combinators: `AND`, `OR`, `NOT`, and parentheses.
+ *   - Literals: single-quoted strings, numbers, `TRUE`/`FALSE`/`NULL`.
+ *
+ * A trivial always-true clause (empty or `1=1`) short-circuits to pass-all.
+ * Unsupported syntax throws a descriptive error rather than silently
+ * returning wrong rows.
+ */
+function compileWherePredicate(where: string): (rec: WhereRecord) => boolean {
+  const src = (where ?? "").trim();
+  if (src === "" || src === "1=1" || src === "1 = 1" || src.toLowerCase() === "true") {
+    return () => true;
   }
-  return out;
+
+  type Tok = { t: string; v: string };
+  const tokens: Tok[] = [];
+  const re =
+    /\s+|metadata\s*->>\s*'([^']*)'|'((?:[^']|'')*)'|(>=|<=|!=|<>|==|=|>|<)|(\()|(\))|,|([A-Za-z_][A-Za-z0-9_]*)|(-?\d+(?:\.\d+)?)/g;
+  let m: RegExpExecArray | null;
+  let lastIndex = 0;
+  while ((m = re.exec(src)) !== null) {
+    if (m.index !== lastIndex) {
+      throw new Error(`recallFiltered: unsupported token near "${src.slice(lastIndex, m.index + 1)}"`);
+    }
+    lastIndex = re.lastIndex;
+    const raw = m[0];
+    if (/^\s+$/.test(raw)) continue;
+    if (m[1] !== undefined) tokens.push({ t: "field", v: `metadata:${m[1]}` });
+    else if (m[2] !== undefined) tokens.push({ t: "str", v: m[2].replace(/''/g, "'") });
+    else if (m[3] !== undefined) tokens.push({ t: "op", v: m[3] });
+    else if (m[4] !== undefined) tokens.push({ t: "lparen", v: "(" });
+    else if (m[5] !== undefined) tokens.push({ t: "rparen", v: ")" });
+    else if (raw === ",") tokens.push({ t: "comma", v: "," });
+    else if (m[6] !== undefined) {
+      const kw = m[6].toUpperCase();
+      if (["AND", "OR", "NOT", "LIKE", "IN", "TRUE", "FALSE", "NULL"].includes(kw)) {
+        tokens.push({ t: "kw", v: kw });
+      } else {
+        tokens.push({ t: "field", v: m[6] });
+      }
+    } else if (m[7] !== undefined) tokens.push({ t: "num", v: m[7] });
+  }
+  if (lastIndex !== src.length) {
+    throw new Error(`recallFiltered: unsupported token near "${src.slice(lastIndex)}"`);
+  }
+
+  // Recursive-descent parser -> predicate closure.
+  let pos = 0;
+  const peek = (): Tok | undefined => tokens[pos];
+  const next = (): Tok | undefined => tokens[pos++];
+  type Pred = (rec: WhereRecord) => boolean;
+
+  const fieldValue = (name: string, rec: WhereRecord): unknown => {
+    if (name.startsWith("metadata:")) {
+      const key = name.slice("metadata:".length);
+      return rec.metadata ? rec.metadata[key] : undefined;
+    }
+    switch (name.toLowerCase()) {
+      case "category": return rec.entry.category;
+      case "importance": return rec.entry.importance;
+      case "createdat": return rec.entry.createdAt;
+      case "text":
+      case "content": return rec.entry.text;
+      case "id": return rec.entry.id;
+      case "similarity":
+      case "score": return rec.score;
+      default:
+        return rec.metadata ? rec.metadata[name] : undefined;
+    }
+  };
+
+  const asNumber = (v: unknown): number | null => {
+    if (typeof v === "number") return Number.isFinite(v) ? v : null;
+    if (typeof v === "string" && v.trim() !== "") {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  };
+
+  const likeToRegExp = (pattern: string): RegExp => {
+    let out = "";
+    for (const ch of pattern) {
+      if (ch === "%") out += ".*";
+      else if (ch === "_") out += ".";
+      else out += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+    return new RegExp(`^${out}$`, "i");
+  };
+
+  const compareOp = (op: string, left: unknown, right: unknown): boolean => {
+    const ln = asNumber(left);
+    const rn = asNumber(right);
+    const bothNum = ln !== null && rn !== null;
+    switch (op) {
+      case "=":
+      case "==":
+        return bothNum ? ln === rn : String(left) === String(right);
+      case "!=":
+      case "<>":
+        return bothNum ? ln !== rn : String(left) !== String(right);
+      case ">": return bothNum ? ln > rn : String(left) > String(right);
+      case ">=": return bothNum ? ln >= rn : String(left) >= String(right);
+      case "<": return bothNum ? ln < rn : String(left) < String(right);
+      case "<=": return bothNum ? ln <= rn : String(left) <= String(right);
+      default:
+        throw new Error(`recallFiltered: unsupported operator "${op}"`);
+    }
+  };
+
+  // literal value parse (for RHS of a comparison / IN list)
+  const parseLiteral = (): unknown => {
+    const tk = next();
+    if (!tk) throw new Error("recallFiltered: unexpected end of WHERE clause");
+    if (tk.t === "str") return tk.v;
+    if (tk.t === "num") return Number(tk.v);
+    if (tk.t === "kw" && tk.v === "TRUE") return true;
+    if (tk.t === "kw" && tk.v === "FALSE") return false;
+    if (tk.t === "kw" && tk.v === "NULL") return null;
+    throw new Error(`recallFiltered: expected a literal, got "${tk.v}"`);
+  };
+
+  const parseComparison = (): Pred => {
+    const tk = next();
+    if (!tk || tk.t !== "field") {
+      throw new Error(`recallFiltered: expected a field name, got "${tk?.v ?? "<end>"}"`);
+    }
+    const fieldName = tk.v;
+    const opTok = peek();
+    // IN (...)
+    if (opTok && opTok.t === "kw" && opTok.v === "IN") {
+      next();
+      const lp = next();
+      if (!lp || lp.t !== "lparen") throw new Error("recallFiltered: expected '(' after IN");
+      const values: unknown[] = [];
+      for (;;) {
+        values.push(parseLiteral());
+        const sep = next();
+        if (sep && sep.t === "comma") continue;
+        if (sep && sep.t === "rparen") break;
+        throw new Error("recallFiltered: malformed IN (...) list");
+      }
+      return (rec) => {
+        const lv = fieldValue(fieldName, rec);
+        return values.some((v) => compareOp("=", lv, v));
+      };
+    }
+    // LIKE
+    if (opTok && opTok.t === "kw" && opTok.v === "LIKE") {
+      next();
+      const lit = parseLiteral();
+      const rx = likeToRegExp(String(lit));
+      return (rec) => rx.test(String(fieldValue(fieldName, rec) ?? ""));
+    }
+    // comparison operator
+    if (!opTok || opTok.t !== "op") {
+      throw new Error(`recallFiltered: expected an operator after "${fieldName}", got "${opTok?.v ?? "<end>"}"`);
+    }
+    next();
+    const rhs = parseLiteral();
+    return (rec) => compareOp(opTok.v, fieldValue(fieldName, rec), rhs);
+  };
+
+  const parsePrimary = (): Pred => {
+    const tk = peek();
+    if (tk && tk.t === "lparen") {
+      next();
+      const inner = parseOr();
+      const rp = next();
+      if (!rp || rp.t !== "rparen") throw new Error("recallFiltered: missing ')'");
+      return inner;
+    }
+    if (tk && tk.t === "kw" && tk.v === "NOT") {
+      next();
+      const inner = parsePrimary();
+      return (rec) => !inner(rec);
+    }
+    return parseComparison();
+  };
+
+  const parseAnd = (): Pred => {
+    let left = parsePrimary();
+    while (peek() && peek()!.t === "kw" && peek()!.v === "AND") {
+      next();
+      const right = parsePrimary();
+      const l = left;
+      left = (rec) => l(rec) && right(rec);
+    }
+    return left;
+  };
+
+  function parseOr(): Pred {
+    let left = parseAnd();
+    while (peek() && peek()!.t === "kw" && peek()!.v === "OR") {
+      next();
+      const right = parseAnd();
+      const l = left;
+      left = (rec) => l(rec) || right(rec);
+    }
+    return left;
+  }
+
+  const predicate = parseOr();
+  if (pos !== tokens.length) {
+    throw new Error(`recallFiltered: unexpected trailing tokens in WHERE clause near "${peek()?.v ?? ""}"`);
+  }
+  return predicate;
 }
 
 // ============================================================================
-// OpenAI Embeddings
+// Embeddings (engine-native)
 // ============================================================================
 //
-// v0.4.0 NOTE: the engine now owns embedding for the core memory ops
-// (`MEMORY_STORE` / `MEMORY_RECALL`). OpenAI is still used by:
+// OpenAI has been fully removed. Client-side embeddings are now produced by
+// the SynapCores engine via `client.embed()` (native `EMBED()`), the same
+// embedding space the engine uses for the core memory ops
+// (`MEMORY_STORE` / `MEMORY_RECALL`). Used by:
 //   - `predictRelevance` / `trainRelevanceModel`: client-side cosine
 //     between query and candidate text.
 //   - `autoLinkSimilar` capture: writing an `embedding` property onto the
 //     Memory graph node so `recallRelated`'s synthetic SIMILAR_TO edge
 //     resolves at MATCH time.
-// Callers that never use the relevance extensions and disable
-// `autoLinkSimilar` will not hit the OpenAI client.
 
 class Embeddings {
-  private client: OpenAI;
-
-  constructor(
-    apiKey: string,
-    private model: string,
-  ) {
-    this.client = new OpenAI({ apiKey });
-  }
+  constructor(private client: SynapCores) {}
 
   async embed(text: string): Promise<number[]> {
-    const response = await this.client.embeddings.create({
-      model: this.model,
-      input: text,
-    });
-    return response.data[0].embedding;
+    return (await this.client.embed(text)) as number[];
   }
 }
 
@@ -844,17 +1066,19 @@ const DEFAULT_RECALL_RELATED_LIMIT = 20;
 /**
  * `linkSimilarMemories` — capture-time graph wiring.
  *
- * Inserts the Memory as a graph node carrying the OpenAI embedding under
- * the property name `embedding` — the field the gateway's brute-force
+ * Inserts the Memory as a graph node carrying the engine-native embedding
+ * under the property name `embedding` — the field the gateway's brute-force
  * vector index is wired against (see
  * `aidb_gateway::routes::graph::attach_default_vector_index`). Once a
  * Memory node exists, `recallRelated` can MATCH `[:SIMILAR_TO > T]`
  * against it and get neighbors back without any pre-stored edges.
  *
- * v0.4.0 NOTE: the engine no longer exposes the vector it used internally
- * for `MEMORY_STORE`, so this helper still embeds the text via the
- * OpenAI client. The two embeddings (engine + OpenAI) need not match;
- * each is independent and serves a different recall path.
+ * NOTE: the engine no longer exposes the vector it used internally for
+ * `MEMORY_STORE`, so this helper re-embeds the text via `client.embed()`.
+ * Because the node-property vector now comes from the engine's own
+ * embedding space (previously it was a separate OpenAI space), it is
+ * consistent with the vectors the engine produces for the core memory
+ * ops — a consistency improvement over the prior OpenAI-based path.
  *
  * Failures here are non-fatal — the capture itself still succeeded in the
  * memory subsystem; we just log and move on so the rest of recall keeps
@@ -1254,8 +1478,8 @@ function createExtensions(
       // proceeds with the remainder.
 
       // Hydrate feedback rows. Embed each query text once; pair with
-      // the stored Memory's content (re-embedded via OpenAI) to get the
-      // cosine feature.
+      // the stored Memory's content (re-embedded via engine-native
+      // `client.embed()`) to get the cosine feature.
       const hydrated: Array<{
         cosine: number;
         age_days: number;
@@ -1402,10 +1626,6 @@ const memoryPlugin = {
 
   register(api: OpenClawPluginApi) {
     const cfg = memoryConfigSchema.parse(api.pluginConfig);
-    // Validate `vectorDimsForModel` runs without throwing; the dimension
-    // value itself isn't used in v0.4.0 because the engine owns embedding
-    // for the core memory ops.
-    vectorDimsForModel(cfg.embedding.model ?? "text-embedding-3-small");
     const namespace = cfg.collection ?? DEFAULT_COLLECTION;
     // The new MemoryClient enforces namespace ^[A-Za-z_][A-Za-z0-9_]*$. Fail
     // loud and early if the OpenClaw config's `collection` value would be
@@ -1424,7 +1644,7 @@ const memoryPlugin = {
       apiKey: cfg.synapcores.apiKey,
     });
     const db = new MemoryDB(client, namespace);
-    const embeddings = new Embeddings(cfg.embedding.apiKey, cfg.embedding.model!);
+    const embeddings = new Embeddings(client);
     const extensions = createExtensions(
       db,
       embeddings,
@@ -1537,8 +1757,9 @@ const memoryPlugin = {
           });
 
           // linkSimilarMemories inserts a Memory graph node carrying an
-          // OpenAI-embedded representation so recallRelated has something
-          // to MATCH against. Failures are non-fatal (logged in-helper).
+          // engine-native embedded representation (via `client.embed()`) so
+          // recallRelated has something to MATCH against. Failures are
+          // non-fatal (logged in-helper).
           if (autoLinkSimilar) {
             try {
               const embedVec = await embeddings.embed(text);
@@ -1807,7 +2028,7 @@ const memoryPlugin = {
         try {
           await preflightGateway(client);
           api.logger.info(
-            `memory-synapcores: initialized (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, namespace: ${namespace}, model: ${cfg.embedding.model})`,
+            `memory-synapcores: initialized (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, namespace: ${namespace}, embeddings: engine-native)`,
           );
         } catch (err) {
           api.logger.warn(`memory-synapcores: ${String((err as Error)?.message ?? err)}`);

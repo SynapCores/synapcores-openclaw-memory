@@ -1,9 +1,4 @@
 export type MemoryConfig = {
-  embedding: {
-    provider: "openai";
-    model?: string;
-    apiKey: string;
-  };
   synapcores: {
     host: string;
     port: number;
@@ -35,16 +30,10 @@ export type MemoryConfig = {
 export const MEMORY_CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as const;
 export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
 
-const DEFAULT_MODEL = "text-embedding-3-small";
 const DEFAULT_HOST = "localhost";
 const DEFAULT_PORT = 8080;
 const DEFAULT_COLLECTION = "openclaw_memories";
 const DEFAULT_GRAPH = "openclaw_memory_graph";
-
-const EMBEDDING_DIMENSIONS: Record<string, number> = {
-  "text-embedding-3-small": 1536,
-  "text-embedding-3-large": 3072,
-};
 
 function assertAllowedKeys(value: Record<string, unknown>, allowed: string[], label: string) {
   const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
@@ -52,14 +41,6 @@ function assertAllowedKeys(value: Record<string, unknown>, allowed: string[], la
     return;
   }
   throw new Error(`${label} has unknown keys: ${unknown.join(", ")}`);
-}
-
-export function vectorDimsForModel(model: string): number {
-  const dims = EMBEDDING_DIMENSIONS[model];
-  if (!dims) {
-    throw new Error(`Unsupported embedding model: ${model}`);
-  }
-  return dims;
 }
 
 function resolveEnvVars(value: string): string {
@@ -70,12 +51,6 @@ function resolveEnvVars(value: string): string {
     }
     return envValue;
   });
-}
-
-function resolveEmbeddingModel(embedding: Record<string, unknown>): string {
-  const model = typeof embedding.model === "string" ? embedding.model : DEFAULT_MODEL;
-  vectorDimsForModel(model);
-  return model;
 }
 
 function parsePort(value: unknown): number {
@@ -97,7 +72,6 @@ export const memoryConfigSchema = {
     assertAllowedKeys(
       cfg,
       [
-        "embedding",
         "synapcores",
         "collection",
         "graph",
@@ -108,13 +82,6 @@ export const memoryConfigSchema = {
       ],
       "memory config",
     );
-
-    const embedding = cfg.embedding as Record<string, unknown> | undefined;
-    if (!embedding || typeof embedding.apiKey !== "string") {
-      throw new Error("embedding.apiKey is required");
-    }
-    assertAllowedKeys(embedding, ["apiKey", "model"], "embedding config");
-    const model = resolveEmbeddingModel(embedding);
 
     const synapcores = cfg.synapcores as Record<string, unknown> | undefined;
     if (!synapcores || typeof synapcores.apiKey !== "string") {
@@ -134,11 +101,6 @@ export const memoryConfigSchema = {
     const useHttps = synapcores.useHttps === true;
 
     return {
-      embedding: {
-        provider: "openai",
-        model,
-        apiKey: resolveEnvVars(embedding.apiKey),
-      },
       synapcores: {
         host,
         port,
@@ -154,17 +116,6 @@ export const memoryConfigSchema = {
     };
   },
   uiHints: {
-    "embedding.apiKey": {
-      label: "OpenAI API Key",
-      sensitive: true,
-      placeholder: "sk-proj-...",
-      help: "API key for OpenAI embeddings (or use ${OPENAI_API_KEY})",
-    },
-    "embedding.model": {
-      label: "Embedding Model",
-      placeholder: DEFAULT_MODEL,
-      help: "OpenAI embedding model to use",
-    },
     "synapcores.host": {
       label: "SynapCores Host",
       placeholder: DEFAULT_HOST,

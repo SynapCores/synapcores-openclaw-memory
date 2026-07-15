@@ -1,21 +1,33 @@
 /**
  * Live smoke for @synapcores/openclaw-memory against the v1.6.5.2-ce gateway
- * on 127.0.0.1:28201. Runs the 7-step flow from the release brief and
+ * on a running gateway (host/port from SYNAPCORES_HOST/PORT). Runs the 7-step flow from the release brief and
  * exits non-zero if any step fails unexpectedly.
  *
  * v0.2.0: steps 4 (recallRelated) and 6 (trainRelevanceModel) now expect
  * REAL passes — the controlled-throw stubs from v0.1.0 are gone.
  *
+ * v0.4.0: OpenAI fully removed — embeddings are engine-native via
+ * `client.embed()`. No embedding provider key is required.
+ *
  * Required env:
- *   OPENAI_API_KEY            — OpenAI key for embeddings
  *   SYNAPCORES_API_KEY        — gateway API key (FullAccess)
+ * Optional env:
+ *   SYNAPCORES_HOST           — gateway host (default 127.0.0.1)
+ *   SYNAPCORES_PORT           — gateway port (default 8100)
  */
 
 import memoryPlugin from "./dist/index.js";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+// SDK 0.6.0 (symlinked as node_modules/@synapcores/sdk -> ../../nodejs-sdk)
+// speaks the gateway's v2 protocol natively: Bearer auth for API keys, the
+// `{ data, meta }` success-envelope unwrap, and the `/ai/embeddings` route.
+// The earlier axios-level accommodations (auth rewrite / envelope unwrap /
+// embed-route override) are therefore gone — with 0.6.0 they would double-fix
+// and are removed so this smoke exercises the plugin + real SDK natively.
+
 const SYNAPCORES_API_KEY = process.env.SYNAPCORES_API_KEY;
-if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY required");
+const SYNAPCORES_HOST = process.env.SYNAPCORES_HOST ?? "127.0.0.1";
+const SYNAPCORES_PORT = Number(process.env.SYNAPCORES_PORT ?? 8100);
 if (!SYNAPCORES_API_KEY) throw new Error("SYNAPCORES_API_KEY required");
 
 // Use a fresh collection name per run so multiple runs don't pollute.
@@ -38,8 +50,7 @@ const mockApi = {
   source: "smoke",
   config: {},
   pluginConfig: {
-    embedding: { apiKey: OPENAI_API_KEY, model: "text-embedding-3-small" },
-    synapcores: { host: "127.0.0.1", port: 28201, apiKey: SYNAPCORES_API_KEY, useHttps: false },
+    synapcores: { host: SYNAPCORES_HOST, port: SYNAPCORES_PORT, apiKey: SYNAPCORES_API_KEY, useHttps: false },
     collection: COLLECTION,
     graph: "openclaw_memory_graph",
     autoCapture: false,
@@ -69,7 +80,7 @@ const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store").t
 const recallTool = registeredTools.find((t) => t.opts?.name === "memory_recall").tool;
 const forgetTool = registeredTools.find((t) => t.opts?.name === "memory_forget").tool;
 
-console.log(`\n=== openclaw-memory live smoke against 127.0.0.1:28201 ===`);
+console.log(`\n=== openclaw-memory live smoke against ${SYNAPCORES_HOST}:${SYNAPCORES_PORT} ===`);
 console.log(`Collection: ${COLLECTION}\n`);
 
 // ---------------------------------------------------------------------------
