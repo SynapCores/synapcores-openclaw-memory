@@ -19,7 +19,7 @@
  * `client.memory` surface. Requires SynapCores gateway v1.8.5-ce+.
  */
 
-import type { OpenClawPluginApi, OpenClawPluginDefinition } from "openclaw/plugin-sdk/core";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { Type } from "typebox";
 import { stringEnum } from "openclaw/plugin-sdk/core";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
@@ -2144,6 +2144,12 @@ const memoryPlugin = {
   },
 };
 
-const pluginEntry: OpenClawPluginDefinition = definePluginEntry(memoryPlugin);
+// Annotate with `ReturnType<typeof definePluginEntry>` (the DefinedPluginEntry
+// shape) so the emitted declaration references only the public, importable
+// `definePluginEntry` symbol instead of an internal openclaw module path.
+// Without this, tsc emits TS2742 because the inferred type points at
+// `openclaw/dist/types-*.js`, which is not a portable/nameable reference.
+const pluginEntry: ReturnType<typeof definePluginEntry> =
+  definePluginEntry(memoryPlugin);
 
 export default pluginEntry;
