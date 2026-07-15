@@ -78,7 +78,7 @@
       "clawhubSpec": "@synapcores/openclaw-memory",
       "npmSpec": "@synapcores/openclaw-memory",
       "defaultChoice": "npm",
-      "minHostVersion": ">=2026.5.12",
+      "minHostVersion": ">=2026.7.1",
       "minSynapCoresEngineVersion": "v1.8.5-ce"
     },
     "build": {
