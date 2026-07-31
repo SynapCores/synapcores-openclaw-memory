@@ -23,8 +23,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { Type } from "typebox";
 import { stringEnum } from "openclaw/plugin-sdk/core";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { SILENT_REPLY_TOKEN } from "openclaw/plugin-sdk/memory-core";
-import type { MemoryFlushPlan } from "openclaw/plugin-sdk/memory-core";
+import { SILENT_REPLY_TOKEN } from "openclaw/plugin-sdk/reply-runtime";
 import { SynapCores } from "@synapcores/sdk";
 import type { MemoryRecord } from "@synapcores/sdk";
 import {
@@ -1100,7 +1099,7 @@ const MEMORY_FLUSH_PROMPT = [
   `If nothing is worth storing, reply with exactly ${SILENT_REPLY_TOKEN}.`,
 ].join(" ");
 
-function buildMemoryFlushPlan(): MemoryFlushPlan | null {
+function buildMemoryFlushPlan() {
   return {
     softThresholdTokens: 4000,
     forceFlushTranscriptBytes: 2 * 1024 * 1024,
