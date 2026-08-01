@@ -1,6 +1,19 @@
 # @synapcores/openclaw-memory
 
-A long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) that uses **SynapCores AIDB** as the storage backend. Drop-in alternative to `@openclaw/memory-lancedb` with the same auto-recall / auto-capture lifecycle, plus four SynapCores-only extensions: SQL-filtered semantic recall, graph-relation walks, AutoML relevance scoring, and a model-training helper.
+A long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) that uses a **SynapCores AIDB** gateway you host as the storage backend. Drop-in alternative to `@openclaw/memory-lancedb`, plus four SynapCores-only extensions: SQL-filtered semantic recall, graph-relation walks, AutoML relevance scoring, and a model-training helper.
+
+> **What it does with your conversations (read this first).** By default the
+> plugin is **passive**: it stores or recalls memory only when you explicitly
+> call a tool (`memory_store` / `memory_recall` / `memory_forget`) or the `ltm`
+> command. It also offers an **opt-in automatic lifecycle** (`autoCapture` /
+> `autoRecall`, both **off by default**). When you turn `autoCapture` on, the
+> plugin becomes proactive: at the **end of every agent turn** and again **just
+> before OpenClaw compacts the context**, it inspects the conversation, infers
+> durable personal facts, preferences, and decisions, and **persists them (in
+> the model's own words) to your SynapCores gateway** — and `autoRecall` injects
+> matching memories back into the model's context on later turns. This is real
+> long-term memory of personal conversation details; enable it deliberately. See
+> [Privacy & data handling](#privacy--data-handling).
 
 > **0.5.0 shipping note:** the core memory ops (`memory_store` / `memory_recall` / `memory_forget`) ride the engine-side `MEMORY_STORE` / `MEMORY_RECALL` / `MEMORY_FORGET` primitives via `@synapcores/sdk@^0.6.0`'s `client.memory` surface. The plugin's public API (tools, CLI, extensions, types) is unchanged.
 >
@@ -131,7 +144,18 @@ This plugin is **privacy-safe by default and passive out of the box.**
   `autoLinkSimilar` all default to `false`. With the defaults, the plugin never
   reads or writes memory on its own — it stores or recalls **only** when you
   explicitly invoke a tool (`memory_store`, `memory_recall`, `memory_forget`) or
-  the `ltm` command. Set them to `true` to opt into the automatic lifecycle.
+  the `ltm` command.
+- **What "opt-in automatic capture" actually does.** When you set
+  `autoCapture: true`, the plugin subscribes to the `agent_end` conversation
+  hook and, **at the end of every agent turn**, inspects that turn and stores the
+  durable personal facts, preferences, and decisions it infers — paraphrased in
+  the model's own words, not raw transcripts — to your gateway. Separately, the
+  **pre-compaction flush** fires **just before OpenClaw discards older context**
+  and prompts the agent to persist anything still worth keeping. Both require the
+  host permission `plugins.entries.memory-synapcores.hooks.allowConversationAccess: true`.
+  `autoRecall: true` then injects matching stored memories back into the model's
+  context on later turns. Turn these on only where proactive persistence of
+  personal conversation details is acceptable.
 - **Pre-compaction flush is part of that opt-in.** The plugin only registers a
   pre-compaction memory-flush capability when `autoCapture` is enabled; with the
   default off, the agent is never prompted to store facts automatically.
