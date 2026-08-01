@@ -678,10 +678,11 @@ describe("memory plugin metadata", () => {
     expect(config?.synapcores?.useHttps).toBe(false);
     expect(config?.collection).toBe("openclaw_memories");
     expect(config?.graph).toBe("openclaw_memory_graph");
-    // autoCapture / autoRecall / autoLinkSimilar default to true
-    expect(config?.autoCapture).toBe(true);
-    expect(config?.autoRecall).toBe(true);
-    expect(config?.autoLinkSimilar).toBe(true);
+    // Privacy-safe defaults: autoCapture / autoRecall / autoLinkSimilar are
+    // opt-in and default to false (the plugin is passive until enabled).
+    expect(config?.autoCapture).toBe(false);
+    expect(config?.autoRecall).toBe(false);
+    expect(config?.autoLinkSimilar).toBe(false);
   });
 });
 
@@ -983,7 +984,9 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
 
   test("registers a pre-compaction memory flush capability (mirrors memory-core's own pattern)", async () => {
     const { default: memoryPlugin } = await import("./index.js");
-    const { mockApi, registeredMemoryCapabilities } = buildMockApi({ autoLinkSimilar: false });
+    // Pre-compaction flush is part of the auto-capture lifecycle, so it is
+    // only registered when autoCapture is opted into.
+    const { mockApi, registeredMemoryCapabilities } = buildMockApi({ autoCapture: true, autoLinkSimilar: false });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     memoryPlugin.register(mockApi as any);
 
@@ -1006,7 +1009,7 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
 
   test("does not crash on hosts without registerMemoryCapability (older OpenClaw versions)", async () => {
     const { default: memoryPlugin } = await import("./index.js");
-    const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: false });
+    const { mockApi, registeredTools } = buildMockApi({ autoCapture: true, autoLinkSimilar: false });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     delete (mockApi as any).registerMemoryCapability;
 

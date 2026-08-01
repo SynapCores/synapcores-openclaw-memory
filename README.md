@@ -93,9 +93,9 @@ typically `~/.openclaw/openclaw.json`). Three things matter: the
           },
           "collection": "openclaw_memories",
           "graph": "openclaw_memory_graph",
-          "autoCapture": true,
-          "autoRecall": true,
-          "autoLinkSimilar": true
+          "autoCapture": false,
+          "autoRecall": false,
+          "autoLinkSimilar": false
         }
       }
     }
@@ -122,6 +122,29 @@ Then `openclaw config validate`. Environment-variable interpolation
 (`${SYNAPCORES_API_KEY}`) is supported in any string field
 so you don't have to commit secrets. (Store keys **clean** — a trailing newline
 in `apiKey` will break auth.)
+
+## Privacy & data handling
+
+This plugin is **privacy-safe by default and passive out of the box.**
+
+- **Automatic capture and recall are opt-in.** `autoCapture`, `autoRecall`, and
+  `autoLinkSimilar` all default to `false`. With the defaults, the plugin never
+  reads or writes memory on its own — it stores or recalls **only** when you
+  explicitly invoke a tool (`memory_store`, `memory_recall`, `memory_forget`) or
+  the `ltm` command. Set them to `true` to opt into the automatic lifecycle.
+- **Pre-compaction flush is part of that opt-in.** The plugin only registers a
+  pre-compaction memory-flush capability when `autoCapture` is enabled; with the
+  default off, the agent is never prompted to store facts automatically.
+- **You control your data.** Review memories with `memory_recall` / `ltm`, and
+  delete them by id or query with `memory_forget` (GDPR-style forget).
+- **No third-party egress or telemetry.** The plugin talks to exactly one
+  endpoint — the **SynapCores gateway you configure** (`synapcores.host` /
+  `apiKey`). It sends no analytics, usage data, or conversation content anywhere
+  else. Your memories live in your own self-hosted database.
+- **Prefer HTTPS + a controlled gateway.** Set `synapcores.useHttps: true` for
+  any non-localhost gateway so memory content is encrypted in transit.
+- **Don't store secrets or regulated data** in shared or sensitive workspaces,
+  and confirm you can review/delete memories before enabling auto-capture there.
 
 ### Config fields
 

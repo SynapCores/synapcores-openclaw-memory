@@ -1742,17 +1742,20 @@ const memoryPlugin = {
       apiKey: cfg.synapcores.apiKey,
     });
 
-    // Same official mechanism OpenClaw's bundled memory-core plugin uses —
-    // the runtime calls this right before the session auto-compacts. Guarded:
-    // older hosts (pre-dating this API) would otherwise crash the entire
-    // register() call — and with it every tool below — over one optional
-    // capability. Missing it just means no pre-compaction flush; everything
-    // else still works.
-    if (typeof api.registerMemoryCapability === "function") {
+    // Pre-compaction flush is part of the automatic-capture lifecycle, so it
+    // is only registered when the operator has opted into `autoCapture`. With
+    // the privacy-safe default (autoCapture off) the plugin never prompts the
+    // agent to store facts on its own — memory is written only when the user
+    // explicitly calls memory_store / the `ltm` command.
+    // Same official mechanism OpenClaw's bundled memory-core plugin uses — the
+    // runtime calls the resolver right before the session auto-compacts.
+    // Guarded: older hosts (pre-dating this API) would otherwise crash the
+    // entire register() call over one optional capability.
+    if (cfg.autoCapture && typeof api.registerMemoryCapability === "function") {
       api.registerMemoryCapability({
         flushPlanResolver: buildMemoryFlushPlan,
       });
-    } else {
+    } else if (cfg.autoCapture) {
       api.logger.debug?.(
         "memory-synapcores: host does not support registerMemoryCapability; skipping pre-compaction flush",
       );

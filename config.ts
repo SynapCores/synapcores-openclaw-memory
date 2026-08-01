@@ -10,12 +10,11 @@ export type MemoryConfig = {
   autoCapture?: boolean;
   autoRecall?: boolean;
   /**
-   * When true (default), the plugin auto-creates `SIMILAR_TO` graph edges at
-   * capture time between a newly-stored memory and its top-K most similar
-   * existing memories (cosine > 0.7). Adds ~30-50ms per capture but makes
-   * `recallRelated` return useful results out of the box. Set to false if
-   * you only need vector recall or you plan to wire your own edge-building
-   * pipeline.
+   * When true (default: false), the plugin auto-creates `SIMILAR_TO` graph
+   * edges at capture time between a newly-stored memory and its top-K most
+   * similar existing memories (cosine > 0.7). Adds ~30-50ms per capture but
+   * makes `recallRelated` return useful results out of the box. Only has an
+   * effect when `autoCapture` is also enabled.
    */
   autoLinkSimilar?: boolean;
   /**
@@ -109,9 +108,14 @@ export const memoryConfigSchema = {
       },
       collection: typeof cfg.collection === "string" ? cfg.collection : DEFAULT_COLLECTION,
       graph: typeof cfg.graph === "string" ? cfg.graph : DEFAULT_GRAPH,
-      autoCapture: cfg.autoCapture !== false,
-      autoRecall: cfg.autoRecall !== false,
-      autoLinkSimilar: cfg.autoLinkSimilar !== false,
+      // Privacy-safe by default: all automatic capture/recall/linking of
+      // conversation-derived facts is OPT-IN. With these off the plugin is
+      // passive — it only reads or writes memory when the user explicitly
+      // invokes a tool (memory_store / memory_recall / memory_forget) or the
+      // `ltm` command. Set each to `true` to enable the automatic lifecycle.
+      autoCapture: cfg.autoCapture === true,
+      autoRecall: cfg.autoRecall === true,
+      autoLinkSimilar: cfg.autoLinkSimilar === true,
       workspace: typeof cfg.workspace === "string" ? cfg.workspace : undefined,
     };
   },

@@ -57,18 +57,21 @@
       },
       "autoCapture": {
         "type": "boolean",
-        "title": "Auto-Capture",
-        "description": "Automatically capture important information from conversations."
+        "title": "Auto-Capture (opt-in)",
+        "default": false,
+        "description": "Opt-in; default off. When enabled, the plugin automatically stores conversation-derived facts to your SynapCores gateway and turns on pre-compaction memory flushing. Leave off (the default) to keep the plugin passive — memory is written only when you explicitly call memory_store or the `ltm` command."
       },
       "autoRecall": {
         "type": "boolean",
-        "title": "Auto-Recall",
-        "description": "Automatically inject relevant memories into context."
+        "title": "Auto-Recall (opt-in)",
+        "default": false,
+        "description": "Opt-in; default off. When enabled, the plugin automatically injects relevant stored memories into the model's context on each turn. Leave off to recall only when you explicitly call memory_recall."
       },
       "autoLinkSimilar": {
         "type": "boolean",
-        "title": "Auto-Link Similar Memories",
-        "description": "On capture, draw SIMILAR_TO graph edges to existing memories with cosine similarity > 0.7 so recallRelated returns useful neighborhoods (adds ~30-50ms per capture)."
+        "title": "Auto-Link Similar Memories (opt-in)",
+        "default": false,
+        "description": "Opt-in; default off. Only applies when autoCapture is enabled. On capture, draws SIMILAR_TO graph edges to existing memories with cosine similarity > 0.7 so recallRelated returns useful neighborhoods (adds ~30-50ms per capture)."
       },
       "workspace": {
         "type": "string",
