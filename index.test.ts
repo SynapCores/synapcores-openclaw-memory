@@ -656,14 +656,71 @@ describe("memory plugin metadata", () => {
     }).toThrow("unknown keys: embedding");
   });
 
-  test("config schema rejects missing synapcores apiKey", async () => {
+  // Was: "rejects missing synapcores apiKey" — it threw here.
+  //
+  // That is exactly what made the plugin uninstallable. OpenClaw validates a
+  // plugin's config schema *during* `plugins install`, before any config can be
+  // written, so throwing on a missing key aborted the install with a Node stack
+  // trace and no way forward. Config is now optional at parse time and the
+  // gateway preflight reports it at runtime instead.
+  test("config parses with no apiKey so the plugin can be installed unconfigured", async () => {
     const { default: memoryPlugin } = await import("./index.js");
 
+    const parsed = memoryPlugin.configSchema?.parse?.({ synapcores: {} }) as
+      | { synapcores: { apiKey: string; host: string; port: number } }
+      | undefined;
+
+    expect(parsed).toBeDefined();
+    expect(parsed?.synapcores.apiKey).toBe("");
+    expect(parsed?.synapcores.host).toBe("localhost");
+  });
+
+  test("config parses with no synapcores block at all", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const parsed = memoryPlugin.configSchema?.parse?.({}) as
+      | { synapcores: { apiKey: string } }
+      | undefined;
+    expect(parsed?.synapcores.apiKey).toBe("");
+  });
+
+  test("apiKey falls back to SYNAPCORES_API_KEY, as the README has always promised", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const previous = process.env.SYNAPCORES_API_KEY;
+    process.env.SYNAPCORES_API_KEY = "aidb_from_env";
+    try {
+      const parsed = memoryPlugin.configSchema?.parse?.({ synapcores: {} }) as
+        | { synapcores: { apiKey: string } }
+        | undefined;
+      expect(parsed?.synapcores.apiKey).toBe("aidb_from_env");
+    } finally {
+      if (previous === undefined) delete process.env.SYNAPCORES_API_KEY;
+      else process.env.SYNAPCORES_API_KEY = previous;
+    }
+  });
+
+  test("an explicit apiKey still wins over the environment", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const previous = process.env.SYNAPCORES_API_KEY;
+    process.env.SYNAPCORES_API_KEY = "aidb_from_env";
+    try {
+      const parsed = memoryPlugin.configSchema?.parse?.({
+        synapcores: { apiKey: "aidb_explicit" },
+      }) as { synapcores: { apiKey: string } } | undefined;
+      expect(parsed?.synapcores.apiKey).toBe("aidb_explicit");
+    } finally {
+      if (previous === undefined) delete process.env.SYNAPCORES_API_KEY;
+      else process.env.SYNAPCORES_API_KEY = previous;
+    }
+  });
+
+  test("unknown keys inside synapcores are still rejected", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
     expect(() => {
       memoryPlugin.configSchema?.parse?.({
-        synapcores: {},
+        // `url` is a common wrong guess — the real keys are host/port/useHttps.
+        synapcores: { apiKey: "k", url: "http://localhost:8080" },
       });
-    }).toThrow("synapcores.apiKey is required");
+    }).toThrow();
   });
 
   test("config schema applies defaults for collection, graph, host, port, autoLinkSimilar", async () => {

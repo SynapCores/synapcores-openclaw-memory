@@ -1,7 +1,7 @@
 {
   "name": "@synapcores/openclaw-memory",
   "version": "0.6.4",
-  "description": "OpenClaw long-term memory plugin backed by your own self-hosted SynapCores AIDB gateway. Passive by default (explicit memory_store/recall/forget tools); an OPT-IN lifecycle, off by default, can proactively capture conversation-derived personal facts at the end of each agent turn and before context compaction. Data stays in your gateway — no third-party egress.",
+  "description": "OpenClaw long-term memory plugin backed by your own self-hosted SynapCores AIDB gateway. Passive by default (explicit memory_store/recall/forget tools); an OPT-IN lifecycle, off by default, can proactively capture conversation-derived personal facts at the end of each agent turn and before context compaction. Data stays in your gateway \u2014 no third-party egress.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -78,7 +78,7 @@
       "clawhubSpec": "@synapcores/openclaw-memory",
       "npmSpec": "@synapcores/openclaw-memory",
       "defaultChoice": "npm",
-      "minHostVersion": ">=2026.7.1",
+      "minHostVersion": ">=2026.4.10",
       "minSynapCoresEngineVersion": "v1.8.5-ce"
     },
     "build": {
@@ -86,7 +86,7 @@
       "pluginSdkVersion": "2026.7.1"
     },
     "compat": {
-      "pluginApi": ">=2026.5.19",
+      "pluginApi": ">=2026.4.10",
       "synapcoresEngine": ">=1.8.5-ce"
     },
     "release": {

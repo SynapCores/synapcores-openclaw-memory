@@ -82,10 +82,7 @@ export const memoryConfigSchema = {
       "memory config",
     );
 
-    const synapcores = cfg.synapcores as Record<string, unknown> | undefined;
-    if (!synapcores || typeof synapcores.apiKey !== "string") {
-      throw new Error("synapcores.apiKey is required");
-    }
+    const synapcores = (cfg.synapcores ?? {}) as Record<string, unknown>;
     assertAllowedKeys(
       synapcores,
       ["host", "port", "apiKey", "useHttps"],
@@ -99,11 +96,26 @@ export const memoryConfigSchema = {
     const port = parsePort(synapcores.port);
     const useHttps = synapcores.useHttps === true;
 
+    // The API key may come from config OR from the environment. The README has
+    // always documented `${SYNAPCORES_API_KEY}`, but requiring the config key
+    // meant the environment variable alone could never satisfy it.
+    //
+    // Resolution order: explicit config value, then SYNAPCORES_API_KEY.
+    // A MISSING key is NOT fatal here. It used to throw, which — because
+    // OpenClaw validates plugin config at install time — made
+    // `openclaw plugins install` abort with a Node stack trace before the
+    // plugin could ever be configured. There is no install-then-configure
+    // path if this throws. The gateway preflight reports the missing key at
+    // runtime with an actionable message instead.
+    const configuredKey =
+      typeof synapcores.apiKey === "string" ? resolveEnvVars(synapcores.apiKey) : "";
+    const apiKey = configuredKey || process.env.SYNAPCORES_API_KEY || "";
+
     return {
       synapcores: {
         host,
         port,
-        apiKey: resolveEnvVars(synapcores.apiKey),
+        apiKey,
         useHttps,
       },
       collection: typeof cfg.collection === "string" ? cfg.collection : DEFAULT_COLLECTION,

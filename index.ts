@@ -242,6 +242,27 @@ async function preflightGateway(client: SynapCores): Promise<void> {
   }
   const url = `${scheme}://${host}:${port}`;
 
+  // No key configured at all. Since 0.6.4 the plugin installs without config
+  // (requiring it made `openclaw plugins install` abort before the user could
+  // ever configure it), so an unconfigured first run is expected and deserves
+  // its own message rather than a confusing "rejected the API key".
+  let configuredKey: string | undefined;
+  try {
+    configuredKey = (
+      client as unknown as { _getConfig?: () => { apiKey?: string } }
+    )._getConfig?.()?.apiKey;
+  } catch {
+    // best-effort
+  }
+  if (configuredKey !== undefined && configuredKey.trim() === "") {
+    throw new Error(
+      "SynapCores memory is installed but not configured yet. Set " +
+        "plugins.entries.memory-synapcores.config.synapcores.apiKey in openclaw.json, " +
+        "or export SYNAPCORES_API_KEY. " +
+        PREFLIGHT_INSTALL_HINT,
+    );
+  }
+
   try {
     await client.executeQuery({ sql: "SELECT 1" });
   } catch (err) {
