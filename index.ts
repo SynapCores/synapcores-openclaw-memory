@@ -999,6 +999,16 @@ type MemoryEnvelope = {
   error?: { code?: string; message?: string; retryable?: boolean } | null;
 };
 
+/**
+ * Attribute used by the credential-pin probe.
+ *
+ * No leading underscore on purpose: the engine's statement parser drops leading
+ * underscores from an attribute identifier (sending `__openclaw_pin_probe` came
+ * back as `openclaw_pin_probe` in the envelope — observed live), so a name that
+ * survives the round trip unchanged keeps the probe's log output honest.
+ */
+const CREDENTIAL_PIN_PROBE_ATTRIBUTE = "openclaw_pin_probe";
+
 /** Minimal shape of the SDK's underlying axios instance that we rely on. */
 type HttpLike = {
   get: (path: string) => Promise<{ data: unknown }>;
@@ -1035,6 +1045,45 @@ export class MemoryFeatureUnavailableError extends Error {
     super(message);
     this.name = "MemoryFeatureUnavailableError";
   }
+}
+
+/**
+ * `memory.identityFrom: "credential"` but the credential carries no pin.
+ *
+ * The gateway mints `memory_identity` for ordinary interactive logins only.
+ * Admins stay unpinned (they must administer other identities) and API keys
+ * stay unpinned (one backend credential legitimately serves many end users and
+ * supplies the identity per request) — so the two most common OpenClaw
+ * credentials, a FullAccess API key and an admin token, both land here. Engines
+ * that predate pin minting land here too: the claim is simply absent.
+ *
+ * The gateway's answer is `400 {"error":{"code":"missing_field","message":
+ * "'identity' is required"}}` — verified live. It is NOT a memory error code,
+ * which is exactly why it needs translating: left alone it reads as a malformed
+ * request rather than "this credential cannot be used in credential mode".
+ *
+ * This is deliberately fatal rather than a silent fall back to a shared
+ * identity: falling back would quietly undo the isolation the mode was chosen
+ * for, and writes would land in a scope the operator never asked for.
+ */
+export class MemoryCredentialUnpinnedError extends Error {
+  readonly code = "MEMORY_CREDENTIAL_UNPINNED";
+  constructor(message: string) {
+    super(message);
+    this.name = "MemoryCredentialUnpinnedError";
+  }
+}
+
+/** The one message every unpinned-credential path emits, so the fix reads the same everywhere. */
+function unpinnedCredentialMessage(context: string): string {
+  return (
+    `memory-synapcores: ${context} sent no identity because memory.identityFrom is "credential" ` +
+    "(the default), but the gateway reports this credential carries no memory_identity pin. " +
+    "The gateway pins ordinary user logins only — API keys and admin tokens are never pinned, " +
+    "and engines older than the pin-minting build never pin anything. Fix it either way: " +
+    "configure an ordinary user's token so the gateway resolves the identity itself, or set " +
+    'memory.identityFrom to "static" (with memory.identity) or "host".'
+  );
 }
 
 /**
@@ -1382,12 +1431,7 @@ function translateMemoryError(
     );
   }
   if (code === "missing_field" && identity === undefined) {
-    return new MemoryFeatureUnavailableError(
-      `memory-synapcores: ${operation} sent no identity because memory.identityFrom is ` +
-        '"credential", but the gateway says this credential carries no memory_identity pin ' +
-        "(API keys and service tokens are never pinned). Either use a pinned JWT, or set " +
-        'memory.identityFrom: "static" with memory.identity.',
-    );
+    return new MemoryCredentialUnpinnedError(unpinnedCredentialMessage(operation));
   }
   return err;
 }
@@ -1501,8 +1545,13 @@ class MemoryRouter {
     if (!this.resolution) {
       this.resolution = this.detect().catch((err) => {
         // Reset so a transient failure (gateway restarting) can be retried,
-        // exactly like the preflight promise in MemoryDB.
-        this.resolution = null;
+        // exactly like the preflight promise in MemoryDB. An unpinned
+        // credential is the exception: it is a configuration fact, not a
+        // transient one, so the verdict sticks rather than re-probing the
+        // gateway twice on every subsequent operation.
+        if (!(err instanceof MemoryCredentialUnpinnedError)) {
+          this.resolution = null;
+        }
         throw err;
       });
     }
@@ -1583,10 +1632,50 @@ class MemoryRouter {
     }
 
     const identityField = String(existing?.identity_field ?? this.cfg.identityField);
+
+    // In credential mode the plugin names no identity, which only works if the
+    // gateway can resolve one from the token's `memory_identity` pin. Find out
+    // NOW rather than on the first real memory operation: the answer is a
+    // property of the credential, it never changes mid-session, and surfacing
+    // it at startup puts it in the log and in `openclaw plugins doctor`
+    // instead of in the middle of somebody's conversation.
+    if (this.identities.source === "credential") {
+      await this.probeCredentialPin();
+    }
+
     return this.settle(
       "memory-object",
       `object '${this.objectDb.name}', IDENTITY ${identityField}, identity source: ${this.identities.source}`,
     );
+  }
+
+  /**
+   * Ask the gateway whether this credential is pinned, without writing anything.
+   *
+   * `CURRENT` is the right probe: it is read-only, it goes through the same
+   * `resolve_identity` enforcement point as every other verb, and an attribute
+   * that was never recorded answers `not_found` rather than erroring — so a
+   * pinned credential costs one cheap 200 and an unpinned one produces the
+   * `missing_field` we are looking for. (Both outcomes verified against a live
+   * gateway.)
+   */
+  private async probeCredentialPin(): Promise<void> {
+    try {
+      const envelope = await this.objectDb.current(undefined, CREDENTIAL_PIN_PROBE_ATTRIBUTE);
+      const resolved = envelope.identity?.value;
+      if (resolved) {
+        this.logger.debug?.(
+          `memory-synapcores: credential is pinned; the gateway resolves memory identity '${resolved}'`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof MemoryCredentialUnpinnedError) {
+        throw new MemoryCredentialUnpinnedError(
+          unpinnedCredentialMessage("memory backend detection"),
+        );
+      }
+      throw err;
+    }
   }
 
   private settle(kind: MemoryBackendKind, detail: string): MemoryBackendKind {
@@ -1596,7 +1685,15 @@ class MemoryRouter {
         ? `memory-synapcores: memory backend = memory-object (${detail})`
         : `memory-synapcores: memory backend = legacy MEMORY_* namespace (${detail})`,
     );
-    if (kind === "legacy" && this.cfg.identityFrom !== "static") {
+    // Only warn when the operator ASKED for per-identity isolation. Since
+    // `credential` became the default, an untouched config on a pre-v1.14.3
+    // gateway would otherwise be told it cannot have something it never
+    // requested — and a warning everybody sees is a warning nobody reads.
+    if (
+      kind === "legacy" &&
+      this.cfg.identityFrom !== "static" &&
+      (this.cfg.identityFromExplicit || this.cfg.requireIsolation)
+    ) {
       const message =
         `memory-synapcores: memory.identityFrom = "${this.cfg.identityFrom}" asks for per-identity ` +
         "isolation, but the legacy MEMORY_* backend has no identity dimension — every identity " +
@@ -2788,6 +2885,7 @@ const memoryPlugin = {
     const asToolError = (err: unknown) => {
       if (
         err instanceof MemoryAccessDeniedError ||
+        err instanceof MemoryCredentialUnpinnedError ||
         err instanceof MemoryFeatureUnavailableError
       ) {
         return {
@@ -2933,27 +3031,31 @@ const memoryPlugin = {
           // which collapses duplicate facts, and conflict resolution, which
           // supersedes contradicted ones — so probing there costs a round-trip
           // AND second-guesses the engine's supersession logic.
-          if ((await router.kind()) === "legacy") {
-            const existing = await db.searchByQuery(text, 1, 0.95);
-            if (existing.length > 0) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Similar memory already exists: "${existing[0].entry.text}"`,
-                  },
-                ],
-                details: {
-                  action: "duplicate",
-                  existingId: existing[0].entry.id,
-                  existingText: existing[0].entry.text,
-                },
-              };
-            }
-          }
-
+          //
+          // `router.kind()` is inside the try because backend detection is
+          // where an unpinned credential is discovered — that has to reach the
+          // model as a readable tool result, not as a raw rejection.
           let stored;
           try {
+            if ((await router.kind()) === "legacy") {
+              const existing = await db.searchByQuery(text, 1, 0.95);
+              if (existing.length > 0) {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: `Similar memory already exists: "${existing[0].entry.text}"`,
+                    },
+                  ],
+                  details: {
+                    action: "duplicate",
+                    existingId: existing[0].entry.id,
+                    existingText: existing[0].entry.text,
+                  },
+                };
+              }
+            }
+
             stored = await router.store(
               { text, vector: [], importance, category },
               identity,
@@ -3397,9 +3499,13 @@ const memoryPlugin = {
             prependContext: `<relevant-memories>\nThe following memories may be relevant to this conversation:\n${memoryContext}\n</relevant-memories>`,
           };
         } catch (err) {
-          if (err instanceof MemoryAccessDeniedError) {
-            // An identity refusal is a configuration problem, not a transient
-            // recall failure — say so instead of burying it in "recall failed".
+          if (
+            err instanceof MemoryAccessDeniedError ||
+            err instanceof MemoryCredentialUnpinnedError
+          ) {
+            // An identity refusal, and an unpinned credential, are both
+            // configuration problems rather than transient recall failures —
+            // say so instead of burying them in "recall failed".
             api.logger.warn(`memory-synapcores: auto-recall refused: ${err.message}`);
             return;
           }
@@ -3485,7 +3591,10 @@ const memoryPlugin = {
             api.logger.info(`memory-synapcores: auto-captured ${stored} memories`);
           }
         } catch (err) {
-          if (err instanceof MemoryAccessDeniedError) {
+          if (
+            err instanceof MemoryAccessDeniedError ||
+            err instanceof MemoryCredentialUnpinnedError
+          ) {
             api.logger.warn(`memory-synapcores: auto-capture refused: ${err.message}`);
             return;
           }

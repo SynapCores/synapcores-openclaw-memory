@@ -53,6 +53,18 @@ const mockApi = {
     synapcores: { host: SYNAPCORES_HOST, port: SYNAPCORES_PORT, apiKey: SYNAPCORES_API_KEY, useHttps: false },
     collection: COLLECTION,
     graph: "openclaw_memory_graph",
+    // This smoke authenticates with an API KEY, and the gateway deliberately
+    // never pins those with a `memory_identity` claim (one service credential
+    // legitimately serves many end users). So the plugin's default
+    // identityFrom: "credential" cannot work here — it would refuse with
+    // MEMORY_CREDENTIAL_UNPINNED, which is correct behaviour but not what this
+    // script is testing. Name the identity explicitly instead. Point
+    // SYNAPCORES_MEMORY_IDENTITY_FROM at "credential" with a pinned user token
+    // to exercise the default path.
+    memory: {
+      identityFrom: process.env.SYNAPCORES_MEMORY_IDENTITY_FROM ?? "static",
+      identity: process.env.SYNAPCORES_MEMORY_IDENTITY ?? `smoke_${RUN_TAG}`,
+    },
     autoCapture: false,
     autoRecall: false,
     autoLinkSimilar: true,
@@ -302,7 +314,25 @@ try {
       if (found2) {
         record(7, "pass", `captured + recalled (broad query) id=${created.details.id.slice(0, 8)}…`);
       } else {
-        record(7, "fail", `created id ${created.details.id} not in recall results`);
+        // Report the relevance SPREAD, not just the miss. A flat spread means
+        // retrieval is not ranking at all — every record scoring the same is
+        // an engine-side symptom (episode/fact embeddings never populated, so
+        // RECALL falls back to a constant), and reads as a plugin bug unless
+        // the numbers are put on screen. A varied spread means the memory
+        // genuinely ranked below the cut.
+        const scores = (broad.details?.memories ?? []).map((m) => Number(m.score));
+        const spread = scores.length
+          ? `${Math.min(...scores).toFixed(4)}..${Math.max(...scores).toFixed(4)}`
+          : "n/a";
+        const flat = scores.length > 1 && Math.max(...scores) - Math.min(...scores) < 1e-6;
+        record(
+          7,
+          "fail",
+          `created id ${created.details.id} not in recall results; relevance spread ${spread}` +
+            (flat
+              ? " — FLAT: retrieval is not ranking. Check that _mem_<name>_{episodes,facts}.embedding is populated; RECALL falls back to a constant relevance when it is NULL."
+              : ""),
+        );
       }
     }
     // Clean up the round-trip memory so it doesn't pollute future runs

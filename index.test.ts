@@ -1168,17 +1168,21 @@ describe("memory plugin metadata", () => {
     expect(config?.autoLinkSimilar).toBe(false);
   });
 
-  test("memory block defaults reproduce the pre-0.7.0 behaviour", async () => {
+  test("memory block defaults: auto-detect the backend, let the gateway resolve the identity", async () => {
     const { default: memoryPlugin } = await import("./index.js");
     const config = memoryPlugin.configSchema?.parse?.({ synapcores: {} }) as
       | { memory: Record<string, unknown> }
       | undefined;
 
-    // auto-detect the backend; one static identity, which is exactly the
-    // isolation the flat legacy namespace gave.
+    // `credential` is the default because the gateway now mints a
+    // memory_identity pin for ordinary user logins: the plugin sends no
+    // identity and therefore cannot address another one. No identity value is
+    // filled in — inventing one here would make the plugin name an identity it
+    // was specifically told not to name.
     expect(config?.memory.backend).toBe("auto");
-    expect(config?.memory.identityFrom).toBe("static");
-    expect(config?.memory.identity).toBe("default");
+    expect(config?.memory.identityFrom).toBe("credential");
+    expect(config?.memory.identity).toBeUndefined();
+    expect(config?.memory.identityFromExplicit).toBe(false);
     expect(config?.memory.identityField).toBe("user_id");
     expect(config?.memory.autoCreate).toBe(true);
     expect(config?.memory.requireIsolation).toBe(false);
@@ -1209,8 +1213,17 @@ describe("memory plugin metadata", () => {
     const credential = memoryPlugin.configSchema?.parse?.({
       synapcores: {},
       memory: { identityFrom: "credential" },
-    }) as { memory: { identity?: string } } | undefined;
+    }) as { memory: { identity?: string; identityFromExplicit: boolean } } | undefined;
     expect(credential?.memory.identity).toBeUndefined();
+    expect(credential?.memory.identityFromExplicit).toBe(true);
+
+    // `static` still fills in the documented default, because it has to
+    // resolve to something and an empty identity is rejected by the engine.
+    const staticMode = memoryPlugin.configSchema?.parse?.({
+      synapcores: {},
+      memory: { identityFrom: "static" },
+    }) as { memory: { identity?: string } } | undefined;
+    expect(staticMode?.memory.identity).toBe("default");
 
     // `host` derives per turn, but an explicit value is still honoured as the
     // documented tool-call fallback.
@@ -1937,6 +1950,14 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
   // ==========================================================================
 
   /**
+   * The identity a pinned user token resolves to. The gateway mints
+   * `memory_identity` = the user's own `sub` for ordinary interactive logins,
+   * so in credential mode this is the value the plugin never names and always
+   * gets.
+   */
+  const PINNED_USER = "user-sub-0001";
+
+  /**
    * Register the plugin with the memory-object surface switched ON in the
    * fake gateway. Returns the usual handles plus the fake's memory-object
    * engine, so a test can inspect what the plugin actually sent.
@@ -1955,6 +1976,15 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     // Detection is lazy — the plugin has not probed yet at this point, so a
     // test can still decide what the gateway looks like.
     fake.memoryObjects.supported = true;
+    // The default identity source is `credential`, which only works against a
+    // credential the gateway pins — an ordinary interactive user token. Model
+    // that by default so the common path is the one under test; `static` and
+    // `host` are for UNPINNED credentials (API keys, admin tokens), so they
+    // get no pin. `tune` still overrides either way.
+    const requestedSource = extraConfig.memory?.identityFrom ?? "credential";
+    if (requestedSource === "credential") {
+      fake.memoryObjects.identityPin = PINNED_USER;
+    }
     tune(fake.memoryObjects);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ext = (memoryPlugin as any).extensions;
@@ -2028,9 +2058,13 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     // supported stays false — the gateway cannot serve it.
 
     const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")!.tool;
-    await expect(
-      storeTool.execute("c1", { text: "I prefer dark mode for everything" }),
-    ).rejects.toThrow(/requires SynapCores engine v1\.14\.3|does not serve \/v1\/memory/);
+    const result = await storeTool.execute("c1", { text: "I prefer dark mode for everything" });
+    // Loud, but readable: the model gets a stable code and a message, not a
+    // raw rejection the host renders as a stack trace. Crucially it did NOT
+    // quietly write to the legacy namespace.
+    expect(result.details.error).toBe("MEMORY_FEATURE_UNAVAILABLE");
+    expect(result.content[0].text).toMatch(/requires SynapCores engine v1\.14\.3|does not serve \/v1\/memory/);
+    expect(getLastFake().memory.storeCalls.length).toBe(0);
   });
 
   test("capability detection: backend 'legacy' never probes and hides the object-only tools", async () => {
@@ -2141,7 +2175,7 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     expect(missing.details.value).toBeNull();
 
     // ok
-    fake.memoryObjects.state.set("openclaw_memories_test|default|subscription_plan", [
+    fake.memoryObjects.state.set(`openclaw_memories_test|${PINNED_USER}|subscription_plan`, [
       { value: "Enterprise", confidence: 0.85, authority: "system_of_record" },
     ]);
     const ok = await currentTool.execute("c3", { attribute: "subscription_plan" });
@@ -2151,7 +2185,7 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     expect(ok.details.confidence).toBeCloseTo(0.85, 5);
 
     // conflict — both claims surface, and the plugin does not pick either.
-    fake.memoryObjects.state.set("openclaw_memories_test|default|cloud_provider", [
+    fake.memoryObjects.state.set(`openclaw_memories_test|${PINNED_USER}|cloud_provider`, [
       { value: "Azure", confidence: 0.7, authority: "user_statement" },
       { value: "AWS", confidence: 0.7, authority: "user_statement" },
     ]);
@@ -2298,13 +2332,125 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
   });
 
   test("identity 'credential' against an UNPINNED credential explains the config fix", async () => {
-    const { tool } = await registerWithMemoryObject({
-      memory: { identityFrom: "credential" },
-    }); // identityPin stays null — an API key is never pinned
+    // An API key or an admin token: the gateway deliberately never pins these,
+    // so credential mode cannot work and must say so rather than writing
+    // somewhere unintended.
+    const { fake, tool } = await registerWithMemoryObject({}, (objects) => {
+      objects.identityPin = null;
+    });
 
     const result = await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+    expect(result.details.error).toBe("MEMORY_CREDENTIAL_UNPINNED");
+    expect(result.content[0].text).toMatch(/carries no memory_identity pin/);
+    // The message must name BOTH fixes, not just the failure.
+    expect(result.content[0].text).toMatch(/ordinary user's token/);
+    expect(result.content[0].text).toMatch(/memory\.identityFrom/);
+    // Nothing was written anywhere — not to the object, not to the legacy
+    // namespace. Falling back to a shared scope is the failure mode this
+    // error exists to prevent.
+    expect(fake.memoryObjects.episodes.length).toBe(0);
+    expect(fake.memory.storeCalls.length).toBe(0);
+  });
+
+  test("an engine that does not mint pins fails credential mode instead of writing to a wrong scope", async () => {
+    // The CREATE MEMORY object exists (so the backend resolves to
+    // memory-object) but this build predates pin minting, so the claim is
+    // simply absent and every unnamed identity comes back as missing_field.
+    const { fake, tool, logs } = await registerWithMemoryObject({}, (objects) => {
+      objects.identityPin = null;
+    });
+
+    const recalled = await tool("memory_recall").execute("c1", { query: "anything at all" });
+    expect(recalled.details.error).toBe("MEMORY_CREDENTIAL_UNPINNED");
+    expect(fake.memoryObjects.episodes.length).toBe(0);
+    // Detection failed, so it never claimed a backend.
+    expect(logs.join("\n")).not.toMatch(/memory backend = /);
+  });
+
+  test("the unpinned verdict is sticky — it does not re-probe the gateway on every call", async () => {
+    const { fake, tool } = await registerWithMemoryObject({}, (objects) => {
+      objects.identityPin = null;
+    });
+
+    await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+    const afterFirst = fake.memoryObjects.calls.length;
+    await tool("memory_store").execute("c2", { text: "I prefer dark mode" });
+    await tool("memory_store").execute("c3", { text: "I prefer dark mode" });
+
+    // An unpinned credential is a configuration fact, not a transient one:
+    // re-probing per operation would just be noise against the gateway.
+    expect(fake.memoryObjects.calls.length).toBe(afterFirst);
+  });
+
+  test("the pin probe is read-only and uses an attribute the engine round-trips unchanged", async () => {
+    const { fake, tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+
+    const probe = fake.memoryObjects.calls.find((c) => /\/current$/.test(c.path));
+    expect(probe).toBeDefined();
+    // CURRENT, not REMEMBER — detection must not write anything.
+    expect((probe!.body as Record<string, unknown>).attribute).toBe("openclaw_pin_probe");
+    expect((probe!.body as Record<string, unknown>).identity).toBeUndefined();
+    // The only episode is the one the test stored.
+    expect(fake.memoryObjects.episodes.length).toBe(1);
+  });
+
+  test("credential mode is the default — no config needed for the gateway to resolve the identity", async () => {
+    const { fake, tool } = await registerWithMemoryObject(); // no `memory` block at all
+
+    const stored = await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+    expect(stored.details.action).toBe("created");
+    const rememberCall = fake.memoryObjects.calls.find((c) => /remember/.test(c.path))!;
+    expect((rememberCall.body as Record<string, unknown>).identity).toBeUndefined();
+    expect(fake.memoryObjects.episodes[0].identity).toBe(PINNED_USER);
+  });
+
+  test("the default (credential) does NOT warn about isolation on a legacy gateway", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools, logs } = buildMockApi({ autoLinkSimilar: false });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+    // supported stays false — a pre-v1.14.3 engine.
+
+    const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")!.tool;
+    await storeTool.execute("c1", { text: "I prefer dark mode for everything" });
+
+    // The operator asked for nothing, so telling them they cannot have
+    // isolation would be a warning everybody sees and nobody reads.
+    expect(logs.join("\n")).toMatch(/memory backend = legacy/);
+    expect(logs.join("\n")).not.toMatch(/asks for per-identity isolation/);
+  });
+
+  test("an EXPLICIT non-static identity source still warns on a legacy gateway", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, logs } = buildMockApi({
+      autoLinkSimilar: false,
+      memory: { identityFrom: "host" },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ext = (memoryPlugin as any).extensions;
+    expect(await ext.backendKind()).toBe("legacy");
+    expect(logs.join("\n")).toMatch(/asks for per-identity isolation/);
+  });
+
+  test("requireIsolation makes the legacy fallback fatal even on the default source", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools } = buildMockApi({
+      autoLinkSimilar: false,
+      memory: { requireIsolation: true },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+
+    const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")!.tool;
+    const result = await storeTool.execute("c1", { text: "I prefer dark mode" });
     expect(result.details.error).toBe("MEMORY_FEATURE_UNAVAILABLE");
-    expect(result.content[0].text).toMatch(/no memory_identity pin/);
+    expect(result.content[0].text).toMatch(/requireIsolation is on/);
+    // The whole point: it refused rather than writing to the shared namespace.
+    expect(getLastFake().memory.storeCalls.length).toBe(0);
   });
 
   test("MEMORY_ACCESS_DENIED is handled explicitly, not as a generic auth failure", async () => {

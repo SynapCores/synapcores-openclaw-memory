@@ -36,9 +36,12 @@ A long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) t
 >   `context.prompt_ready` projection instead of a hand-assembled list — so
 >   current state outranks a semantically similar older episode, and the token
 >   budget truncates the low-priority half rather than the authoritative half.
-> - **Per-identity isolation.** Memory is scoped by an identity the engine
->   enforces; a credential pinned to one identity is refused
->   (`MEMORY_ACCESS_DENIED`) if it names another. See
+> - **Per-identity isolation, with no configuration.** `memory.identityFrom`
+>   defaults to `credential`: the plugin sends no identity and the gateway
+>   resolves it from the token's `memory_identity` pin, so the plugin cannot
+>   address another identity because it never names one. **This needs an
+>   ordinary user token** — API keys and admin tokens are never pinned; with
+>   one of those, set `memory.identityFrom: "static"`. See
 >   [Identity](#identity--who-a-memory-belongs-to).
 > - **The engine owns dedup.** The old client-side "is this a near-duplicate?"
 >   probe before every store is gone on this backend; consolidation, supersession
@@ -219,8 +222,8 @@ This plugin is **privacy-safe by default and passive out of the box.**
 | `memory.backend` | no | `auto` | `auto` \| `memory-object` \| `legacy`. `auto` probes once and picks; `memory-object` fails loudly on an engine older than v1.14.3-ce; `legacy` never probes. |
 | `memory.name` | no | = `collection` | Name of the `CREATE MEMORY` object. Must match `^[A-Za-z_][A-Za-z0-9_]*$`, ≤64 chars — it becomes part of five table names. |
 | `memory.identityField` | no | `user_id` | `IDENTITY <field>` used when the plugin creates the object. Ignored afterwards. |
-| `memory.identityFrom` | no | `static` | `static` \| `host` \| `credential` — see [Identity](#identity--who-a-memory-belongs-to). |
-| `memory.identity` | no | `default` | Identity value for `static` mode; tool-call fallback for `host` mode. |
+| `memory.identityFrom` | no | `credential` | `credential` \| `static` \| `host` — see [Identity](#identity--who-a-memory-belongs-to). |
+| `memory.identity` | no | — (`default` in `static` mode) | Identity value for `static` mode; tool-call fallback for `host` mode. Ignored in `credential` mode. |
 | `memory.autoCreate` | no | `true` | Create the memory object on first use when the gateway supports it. |
 | `memory.requireIsolation` | no | `false` | Fail instead of falling back to the legacy backend when per-identity isolation was asked for. |
 | `memory.tokenBudget` | no | `512` | `token_budget` for prompt-injection `RECALL`. |
@@ -238,24 +241,42 @@ install. The `CREATE MEMORY` object splits that into an object plus a per-call
 
 The plugin never *guesses* an identity, because guessing wrong means one user
 reading another user's memory. OpenClaw tool handlers receive no session or
-user context (the host's `execute()` signature has none), so `memory.identityFrom`
-tells the plugin where the identity actually comes from:
+user context (the host's `execute()` signature has none) — which is exactly why
+the default lets the **gateway** supply what the host cannot:
 
 | `memory.identityFrom` | Behaviour | Use it when |
 | --- | --- | --- |
-| `static` (default) | Every call uses `memory.identity` (default `"default"`). One identity for the whole install — the same isolation the legacy shared namespace gave. | One OpenClaw host, one person. The normal case. |
-| `credential` | The plugin sends **no** identity; the gateway resolves it from the token's `memory_identity` claim. The plugin cannot address another identity because it never names one. | You mint per-user JWTs and want the database to enforce isolation. |
-| `host` | Derived per turn from the OpenClaw hook context (`senderId` → `accountId` → `sessionKey` → `sessionId`). Tool calls, which have no context, use `memory.identity` if set and otherwise **refuse**. | A multi-user host — a Discord/Slack bot serving many people. |
+| `credential` (default) | The plugin sends **no** identity; the gateway resolves it from the token's `memory_identity` claim. The plugin cannot address another identity because it never names one. | Your credential is an ordinary user token. Needs no configuration. |
+| `static` | Every call uses `memory.identity` (default `"default"`). One identity for the whole install — the same isolation the legacy shared namespace gave. | Your credential is an **API key** or an admin token (the gateway never pins those), and one host serves one person. |
+| `host` | Derived per turn from the OpenClaw hook context (`senderId` → `accountId` → `sessionKey` → `sessionId`). Tool calls, which have no context, use `memory.identity` if set and otherwise **refuse**. | A multi-user host — a Discord/Slack bot serving many people through one backend credential. |
+
+**Which credentials the gateway pins.** Ordinary interactive logins get
+`memory_identity` set to the user's own id. **Admin tokens and API keys stay
+unpinned on purpose**: an admin must be able to administer (and `FORGET` on
+behalf of) other identities, and one service key legitimately serves many end
+users, supplying the identity per request.
+
+> **If you followed the README's setup and created a FullAccess API key**, that
+> key is unpinned, so the default `credential` mode will refuse with
+> `MEMORY_CREDENTIAL_UNPINNED` and tell you so at startup. Set
+> `memory.identityFrom: "static"` (or `"host"` for a multi-user bot) — one line
+> — or configure an ordinary user's token instead. The plugin refuses rather
+> than quietly writing everything into a shared scope you did not choose.
 
 A credential pinned to one identity that names a different one is refused with
 HTTP 403 `MEMORY_ACCESS_DENIED`. The plugin surfaces that as its own error with
 the fix in the message — it is never retried against another identity and never
 reported as "the gateway is unreachable".
 
+Identity is defence in depth, not the only boundary: each registered CE user
+gets its own tenant, and memory objects are tenant-keyed, so two registered
+users cannot reach each other's memory regardless of this setting.
+
 **On a pre-v1.14.3 engine there is no identity dimension at all**: the legacy
-namespace is shared. Choosing `host` or `credential` on such a gateway logs a
-prominent warning; set `memory.requireIsolation: true` to make it a hard failure
-instead.
+namespace is shared and this whole section is moot — the plugin stays on the
+legacy backend and never probes for a pin. If you *explicitly* asked for `host`
+or `credential` on such a gateway it logs a prominent warning; set
+`memory.requireIsolation: true` to make it a hard failure instead.
 
 ## What you get
 

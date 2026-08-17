@@ -5,8 +5,9 @@ followed, plus the record of what the new backend cannot do and how the plugin
 keeps those cases working.
 
 Everything marked **VERIFIED** below was exercised against a live SynapCores
-engine (`v1.14.3`-class build, `http://127.0.0.1:18193`) while writing this.
-Everything marked **REASONED** was derived from the engine source
+engine (`v1.14.3`-class build, `http://127.0.0.1:18193`) while writing this —
+across two sessions, the second after the engine gained pinned-token minting
+(§3). Everything marked **REASONED** was derived from the engine source
 (`crates/aidb-gateway/src/routes/memory.rs`, `crates/aidb-mcp-server/src/tools/sql_manual.rs`,
 `AIDB_SQL_MANUAL.md` §"Persistent agent memory (v1.14.3+)") but not run.
 
@@ -126,25 +127,89 @@ losing that race means one user reading another user's memory. So the plugin
 never guesses an identity — it resolves one of three ways, and refuses when it
 cannot.
 
+That constraint is unchanged, and it is precisely **why `credential` is the
+right default**: the gateway supplies the one thing the host does not.
+
+### The default moved from `static` to `credential`
+
+The first cut of this document defaulted to `"static"` and recorded, as
+finding #3, that *nothing in the gateway ever minted a pinned token* — the
+`memory_identity` claim was enforced on every read and write and populated by
+no code path, so `credential` mode was unusable in practice and defaulting to
+it would have shipped a plugin that could not write.
+
+**That is fixed.** `create_token` now sets `memory_identity` to the user's own
+`sub` for ordinary interactive logins. Admins (`admin` / `super_admin`) and API
+keys stay unpinned deliberately: an admin has to be able to administer — and
+`FORGET` on behalf of — other identities, and one service credential
+legitimately serves many end users and supplies the identity per request.
+
+So the default is now `credential`, because it is the only mode in which the
+plugin *cannot* address the wrong identity — it never names one at all. The
+other two remain, and are the right answer for the credentials the gateway
+deliberately leaves unpinned.
+
 `memory.identityFrom`:
 
-* **`"static"` (default)** — every call uses `memory.identity` (default
-  `"default"`). One identity for the whole install. This is *exactly* the
-  isolation the legacy shared namespace gave, so upgrading changes nothing
-  about who can see what; it is honest rather than better. Right for the normal
-  OpenClaw deployment: one host, one person.
-* **`"credential"`** — the plugin sends **no** identity at all and the gateway
-  resolves it from the token's `memory_identity` claim. This is the strongest
-  option: the plugin *cannot* address another identity, because it never names
-  one. Requires a JWT minted with the pin. If the configured credential is
-  unpinned, the gateway answers `400 missing_field` and the plugin raises an
-  actionable error naming both fixes.
+* **`"credential"` (default)** — the plugin sends **no** identity and the
+  gateway resolves it from the token's `memory_identity` claim. Strongest
+  isolation available, and it needs no configuration. Requires a credential the
+  gateway pins: an ordinary user token, on an engine build that mints the claim.
+* **`"static"`** — every call uses `memory.identity` (default `"default"`).
+  One identity for the whole install — exactly the isolation the legacy shared
+  namespace gave. The right answer when the credential is an API key or an
+  admin token, which the gateway never pins.
 * **`"host"`** — per-turn, derived from the hook context in priority order
   `senderId` → `accountId` → `sessionKey` → `sessionId`. Correct for a
-  multi-user host (a Discord/Slack bot). Tool calls, which have no context,
-  use `memory.identity` if it is set and otherwise **refuse the call** with an
-  actionable message. Refusing is the point: the alternative is a shared
-  bucket, which is the leak.
+  multi-user host (a Discord/Slack bot) driven by one unpinned backend
+  credential. Tool calls, which have no context, use `memory.identity` if it is
+  set and otherwise **refuse the call** with an actionable message. Refusing is
+  the point: the alternative is a shared bucket, which is the leak.
+
+### The unpinned-credential case is explicit, and fatal
+
+An unpinned credential in `credential` mode gets
+`400 {"error":{"code":"missing_field","message":"'identity' is required"}}`
+(**VERIFIED** live with an admin token). Note what that is *not*: it carries no
+`MEMORY_*` code, so left untranslated it reads as a malformed request rather
+than "this credential cannot be used this way".
+
+The plugin therefore:
+
+1. **Probes at detection time, not on the first write.** Once the backend
+   resolves to `memory-object` and the mode is `credential`, it issues one
+   read-only `CURRENT … ATTRIBUTE openclaw_pin_probe` with no identity. A
+   pinned credential answers `200 / not_found` (harmless — the attribute was
+   never recorded) and the envelope names the resolved identity; an unpinned one
+   produces the `missing_field`. Both outcomes **VERIFIED** live.
+2. **Raises `MemoryCredentialUnpinnedError`** (`code:
+   "MEMORY_CREDENTIAL_UNPINNED"`) naming both fixes — use an ordinary user's
+   token, or set `identityFrom` to `static`/`host` with an identity.
+3. **Does not fall back.** Quietly writing to a shared identity would undo the
+   isolation the mode exists for, and would put memories in a scope the
+   operator never chose. The verdict is cached rather than re-probed, because
+   an unpinned credential is a configuration fact, not a transient one.
+
+The same path covers an **engine that predates pin minting**: the claim is
+simply absent, the gateway answers `missing_field`, and the plugin fails with
+the same actionable error instead of writing somewhere unintended.
+
+> **Consequence worth stating plainly.** The README's documented setup — create
+> a FullAccess **API key** in the admin UI — produces an *unpinned* credential.
+> On a v1.14.3+ gateway that setup now needs one line of config
+> (`memory.identityFrom: "static"`, or `"host"` for a multi-user bot), because
+> the default refuses rather than guesses. On a pre-v1.14.3 gateway nothing
+> changes: the legacy backend has no identity dimension, so the probe never
+> runs.
+
+### Tenancy is a separate, stronger boundary
+
+CE registration assigns each user its **own** `company_id`, and memory objects
+are tenant-keyed — so two registered users already cannot reach each other's
+memory at all; a cross-tenant read 404s on the memory object itself. The
+identity pin is **defence in depth on top of that**, plus the mechanism that
+makes `credential` mode possible. It is not what stops cross-user reads on a
+default install, and this plugin's comments do not claim it is.
 
 Identity values are trimmed, capped at 128 chars, and rejected when empty. They
 land in a SQL string literal on the engine side (`lit()`, quote-doubling), so
@@ -162,8 +227,11 @@ that warning into a hard failure for operators who cannot ship without it.
 
 A pinned credential naming a different identity is refused with
 HTTP 403 + `error.code = "MEMORY_ACCESS_DENIED"` before any SQL is composed
-(**REASONED** — read in `resolve_identity`; not reproduced live because this
-build exposes no route that mints a pinned JWT, see §7).
+(**REASONED** — read in `resolve_identity`. Not reproduced live: registration
+requires system-level auth that this session did not hold, so no pinned token
+could be obtained. The unpinned half of the same enforcement point *was*
+verified live, and the fake gateway in `index.test.ts` reproduces
+`resolve_identity` in full.)
 
 The `@synapcores/sdk` collapses **any** 403 into `AuthenticationError` with
 `code: "AUTH_ERROR"`, which would make a memory-authorization refusal
@@ -316,13 +384,37 @@ plugin needs them fixed:
   Harmless once known, but every other `/v1` collection route in the gateway is
   reachable both ways, so a client written from the docs can trip on it.
   **VERIFIED**.
-* **No route mints a `memory_identity`-pinned JWT.** `Claims.memory_identity`
-  is enforced everywhere it matters, but `/v1/auth/login` always emits
-  `memory_identity: null` and nothing else in `aidb-gateway` sets it to
-  `Some(_)` — so the pin is only reachable for deployments that mint their own
-  JWTs with the gateway's signing secret. `identityFrom: "credential"` is
-  implemented and documented against that reality. **VERIFIED** (login token
-  decoded; `grep memory_identity` over `crates/aidb-gateway/src`).
+* ~~**No route mints a `memory_identity`-pinned JWT.**~~ **FIXED in the
+  engine.** `create_token` now sets `memory_identity` to the user's `sub` for
+  ordinary logins; admins and API keys stay unpinned by design. This was the
+  blocker for defaulting to `credential` mode, and its removal is why the
+  default moved (§3). **VERIFIED**: the minting branch read in `auth.rs`, an
+  admin login decoded and confirmed still `memory_identity: null`, and the
+  unpinned-credential rejection reproduced end to end.
+* **A leading underscore is stripped from an attribute identifier.** Sending
+  `CURRENT … ATTRIBUTE __openclaw_pin_probe` returned an envelope reporting
+  `"attribute": "openclaw_pin_probe"`. Harmless here — the plugin's probe name
+  avoids leading underscores so it round-trips unchanged — but an attribute
+  written as `_internal` and read back as `internal` would be a confusing
+  mismatch. **VERIFIED**.
+* **🔴 `RECALL` relevance is a constant — semantic retrieval does not rank.**
+  On the current build, `_mem_<name>_episodes.embedding` and
+  `_mem_<name>_facts.embedding` are **NULL for every row**, before and after a
+  forced `CONSOLIDATE` (`derivation_status` advances `partial` → `derived`, the
+  embedding stays NULL). `RECALL` consequently returns the same relevance
+  (~0.4988) for every record whatever the query, so ordering is insertion
+  order. Asking *"what does the user like in coffee?"* over 11 memories scored
+  "I prefer dark mode", "email is alice@example" and "We decided to use
+  TypeScript" identically, and the actual coffee memory did not make the top 3.
+  This is not a missing model: `SELECT COSINE_SIMILARITY(EMBED('coffee
+  oatmilk'), EMBED('the user takes oatmilk in coffee'))` = **0.886** against
+  **-0.010** for an unrelated pair on the same instance, so embedding works and
+  discriminates. Everything else on the object — current state, `CURRENT`,
+  `TRACE`, `FORGET`, provenance, temporal supersession — behaved correctly in
+  the same run. Nothing is wrong on the client side: the plugin reads
+  `relevance` as given, and there is no signal in the envelope that ranking is
+  degenerate (a flat 0.5 looks like a real score). `live-smoke.mjs` step 7
+  detects and names this case. **VERIFIED**.
 * **`context.prompt_ready` is repetitive** on this build: the projection
   concatenated each fact and then each episode containing the same sentence
   (`"subscription plan is Enterprise. subscription plan is Enterprise I prefer

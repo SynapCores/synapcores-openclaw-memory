@@ -12,11 +12,15 @@ export const MEMORY_BACKENDS = ["auto", "memory-object", "legacy"] as const;
 export type MemoryBackendMode = (typeof MEMORY_BACKENDS)[number];
 
 /**
- * Where the per-call memory identity comes from. See MIGRATION.md §3 — this
- * is the one decision that determines whether two users can read each other's
- * memory, so the plugin refuses to guess.
+ * Where the per-call memory identity comes from. See MIGRATION.md §3.
+ *
+ * `credential` is the default: the plugin sends no identity and the gateway
+ * resolves it from the token's `memory_identity` pin, so the plugin cannot
+ * address another identity because it never names one. `static` and `host`
+ * remain for credentials the gateway does not pin (API keys, admin tokens) and
+ * for engines that predate pin minting.
  */
-export const MEMORY_IDENTITY_SOURCES = ["static", "host", "credential"] as const;
+export const MEMORY_IDENTITY_SOURCES = ["credential", "static", "host"] as const;
 export type MemoryIdentitySource = (typeof MEMORY_IDENTITY_SOURCES)[number];
 
 export type MemoryObjectConfig = {
@@ -26,6 +30,14 @@ export type MemoryObjectConfig = {
   /** `IDENTITY <field>` used when the plugin has to CREATE the object. */
   identityField: string;
   identityFrom: MemoryIdentitySource;
+  /**
+   * True when the operator named `identityFrom` explicitly.
+   *
+   * Needed because the default is now `credential`: a plain install on a
+   * pre-v1.14.3 gateway must not be warned that it "asked for isolation it
+   * cannot have" when it asked for nothing at all.
+   */
+  identityFromExplicit: boolean;
   /** Static identity value (used by `identityFrom: "static"`, and as the tool-call fallback for `"host"`). */
   identity?: string;
   /** CREATE the memory object when the gateway has the feature but not the object. */
@@ -151,7 +163,7 @@ function parseMemoryBlock(value: unknown): MemoryObjectConfig {
   const identityFrom = parseEnum(
     mem.identityFrom,
     MEMORY_IDENTITY_SOURCES,
-    "static",
+    "credential",
     "memory.identityFrom",
   );
   const identity =
@@ -177,6 +189,7 @@ function parseMemoryBlock(value: unknown): MemoryObjectConfig {
 
   return {
     backend: parseEnum(mem.backend, MEMORY_BACKENDS, "auto", "memory.backend"),
+    identityFromExplicit: mem.identityFrom !== undefined,
     name: typeof mem.name === "string" && mem.name.length > 0 ? mem.name : undefined,
     identityField:
       typeof mem.identityField === "string" && mem.identityField.length > 0
@@ -327,12 +340,12 @@ export const memoryConfigSchema = {
     "memory.identityFrom": {
       label: "Memory Identity Source",
       advanced: true,
-      help: "static = one identity for this install (default). credential = let the gateway resolve it from the token's memory_identity pin. host = derive per turn from the OpenClaw sender/session (multi-user hosts).",
+      help: "credential (default) sends no identity and lets the gateway resolve the token's memory_identity pin — the plugin cannot address another identity because it never names one. Requires an ordinary user token; API keys and admin tokens are never pinned, so use static (one identity for this install) or host (derive per turn from the OpenClaw sender/session) with those.",
     },
     "memory.identity": {
       label: "Memory Identity",
       advanced: true,
-      help: "Identity value used when identityFrom is 'static' (default: 'default'), and the tool-call fallback when identityFrom is 'host'.",
+      help: "Identity value used when identityFrom is 'static' (defaults to 'default'), and the tool-call fallback when identityFrom is 'host'. Ignored in credential mode.",
     },
     "memory.autoCreate": {
       label: "Auto-Create Memory Object",
