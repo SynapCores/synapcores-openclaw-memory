@@ -1,3 +1,43 @@
+/**
+ * Which engine surface backs the plugin's memory operations.
+ *
+ * - `memory-object`: the v1.14.3+ `CREATE MEMORY` object and its five verbs
+ *   (REMEMBER / RECALL / CURRENT / FORGET / TRACE), over `/v1/memory/*`.
+ * - `legacy`: the flat `MEMORY_STORE` / `MEMORY_RECALL` / `MEMORY_FORGET`
+ *   primitives (engine v1.8.5+). Still fully supported — it is the fallback
+ *   for engines that predate the memory object.
+ * - `auto` (default): probe the gateway once and pick.
+ */
+export const MEMORY_BACKENDS = ["auto", "memory-object", "legacy"] as const;
+export type MemoryBackendMode = (typeof MEMORY_BACKENDS)[number];
+
+/**
+ * Where the per-call memory identity comes from. See MIGRATION.md §3 — this
+ * is the one decision that determines whether two users can read each other's
+ * memory, so the plugin refuses to guess.
+ */
+export const MEMORY_IDENTITY_SOURCES = ["static", "host", "credential"] as const;
+export type MemoryIdentitySource = (typeof MEMORY_IDENTITY_SOURCES)[number];
+
+export type MemoryObjectConfig = {
+  backend: MemoryBackendMode;
+  /** Memory-object name. Defaults to `collection`, so one name covers both backends. */
+  name?: string;
+  /** `IDENTITY <field>` used when the plugin has to CREATE the object. */
+  identityField: string;
+  identityFrom: MemoryIdentitySource;
+  /** Static identity value (used by `identityFrom: "static"`, and as the tool-call fallback for `"host"`). */
+  identity?: string;
+  /** CREATE the memory object when the gateway has the feature but not the object. */
+  autoCreate: boolean;
+  /** Turn the "legacy backend cannot isolate identities" warning into a hard failure. */
+  requireIsolation: boolean;
+  /** `token_budget` passed to RECALL for the auto-recall hook's prompt injection. */
+  tokenBudget: number;
+  /** `source_type` (claim authority) for memories written through the memory_store tool. */
+  sourceType: string;
+};
+
 export type MemoryConfig = {
   synapcores: {
     host: string;
@@ -7,6 +47,7 @@ export type MemoryConfig = {
   };
   collection?: string;
   graph?: string;
+  memory: MemoryObjectConfig;
   autoCapture?: boolean;
   autoRecall?: boolean;
   /**
@@ -33,6 +74,17 @@ const DEFAULT_HOST = "localhost";
 const DEFAULT_PORT = 8080;
 const DEFAULT_COLLECTION = "openclaw_memories";
 const DEFAULT_GRAPH = "openclaw_memory_graph";
+const DEFAULT_IDENTITY_FIELD = "user_id";
+const DEFAULT_IDENTITY = "default";
+// The engine's RECALL default is generous; 512 keeps per-turn prompt injection
+// affordable on the small local models CE ships with.
+const DEFAULT_TOKEN_BUDGET = 512;
+// Authority of a claim written via the memory_store tool. The engine's ladder
+// is system_of_record > verified_user_statement > user_statement > tool_result
+// > prior_user_statement > agent_derivation > agent_inference. A tool call is
+// the agent writing down what the user said, so `user_statement` is the honest
+// default; auto-capture overrides it per turn from the message role.
+const DEFAULT_SOURCE_TYPE = "user_statement";
 
 function assertAllowedKeys(value: Record<string, unknown>, allowed: string[], label: string) {
   const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
@@ -50,6 +102,96 @@ function resolveEnvVars(value: string): string {
     }
     return envValue;
   });
+}
+
+function parseEnum<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  fallback: T,
+  label: string,
+): T {
+  if (value === undefined) {
+    return fallback;
+  }
+  if (typeof value === "string" && (allowed as readonly string[]).includes(value)) {
+    return value as T;
+  }
+  throw new Error(`${label} must be one of: ${allowed.join(", ")}`);
+}
+
+/**
+ * Parse the `memory` block — the CREATE MEMORY (SRS v1.2) backend controls.
+ *
+ * Every field has a default that reproduces the pre-0.7.0 behaviour as closely
+ * as the new backend allows, so an existing config keeps working untouched:
+ * backend auto-detects, and identity is a single static value (which is the
+ * same isolation the flat legacy namespace gave — see MIGRATION.md §3).
+ */
+function parseMemoryBlock(value: unknown): MemoryObjectConfig {
+  if (value !== undefined && (typeof value !== "object" || value === null || Array.isArray(value))) {
+    throw new Error("memory config must be an object");
+  }
+  const mem = (value ?? {}) as Record<string, unknown>;
+  assertAllowedKeys(
+    mem,
+    [
+      "backend",
+      "name",
+      "identityField",
+      "identityFrom",
+      "identity",
+      "autoCreate",
+      "requireIsolation",
+      "tokenBudget",
+      "sourceType",
+    ],
+    "memory config",
+  );
+
+  const identityFrom = parseEnum(
+    mem.identityFrom,
+    MEMORY_IDENTITY_SOURCES,
+    "static",
+    "memory.identityFrom",
+  );
+  const identity =
+    typeof mem.identity === "string" && mem.identity.trim().length > 0
+      ? mem.identity.trim()
+      : undefined;
+
+  // `static` has to resolve to *something*, and an empty string is not a valid
+  // identity on the engine side (resolve_identity rejects it), so fill the
+  // documented default rather than failing an otherwise-valid install.
+  const staticIdentity = identityFrom === "static" ? (identity ?? DEFAULT_IDENTITY) : identity;
+
+  const tokenBudget =
+    mem.tokenBudget === undefined
+      ? DEFAULT_TOKEN_BUDGET
+      : typeof mem.tokenBudget === "number" &&
+          Number.isInteger(mem.tokenBudget) &&
+          mem.tokenBudget > 0
+        ? mem.tokenBudget
+        : (() => {
+            throw new Error("memory.tokenBudget must be a positive integer");
+          })();
+
+  return {
+    backend: parseEnum(mem.backend, MEMORY_BACKENDS, "auto", "memory.backend"),
+    name: typeof mem.name === "string" && mem.name.length > 0 ? mem.name : undefined,
+    identityField:
+      typeof mem.identityField === "string" && mem.identityField.length > 0
+        ? mem.identityField
+        : DEFAULT_IDENTITY_FIELD,
+    identityFrom,
+    identity: staticIdentity,
+    autoCreate: mem.autoCreate !== false,
+    requireIsolation: mem.requireIsolation === true,
+    tokenBudget,
+    sourceType:
+      typeof mem.sourceType === "string" && mem.sourceType.length > 0
+        ? mem.sourceType
+        : DEFAULT_SOURCE_TYPE,
+  };
 }
 
 function parsePort(value: unknown): number {
@@ -74,6 +216,7 @@ export const memoryConfigSchema = {
         "synapcores",
         "collection",
         "graph",
+        "memory",
         "autoCapture",
         "autoRecall",
         "autoLinkSimilar",
@@ -120,6 +263,7 @@ export const memoryConfigSchema = {
       },
       collection: typeof cfg.collection === "string" ? cfg.collection : DEFAULT_COLLECTION,
       graph: typeof cfg.graph === "string" ? cfg.graph : DEFAULT_GRAPH,
+      memory: parseMemoryBlock(cfg.memory),
       // Privacy-safe by default: all automatic capture/recall/linking of
       // conversation-derived facts is OPT-IN. With these off the plugin is
       // passive — it only reads or writes memory when the user explicitly
@@ -164,6 +308,51 @@ export const memoryConfigSchema = {
       placeholder: DEFAULT_GRAPH,
       advanced: true,
       help: "SynapCores graph name used for memory relations (SIMILAR_TO edges + recallRelated walks).",
+    },
+    "memory.backend": {
+      label: "Memory Backend",
+      advanced: true,
+      help: "auto (default) probes the gateway and uses the v1.14.3+ CREATE MEMORY object when available, falling back to the legacy MEMORY_* namespace. Force with 'memory-object' or 'legacy'.",
+    },
+    "memory.name": {
+      label: "Memory Object Name",
+      advanced: true,
+      help: "Name of the CREATE MEMORY object. Defaults to the collection name. Must match ^[A-Za-z_][A-Za-z0-9_]*$ and be at most 64 characters.",
+    },
+    "memory.identityField": {
+      label: "Memory Identity Field",
+      advanced: true,
+      help: "IDENTITY field used when the plugin creates the memory object (default user_id). Ignored once the object exists — the gateway reads the field from the object.",
+    },
+    "memory.identityFrom": {
+      label: "Memory Identity Source",
+      advanced: true,
+      help: "static = one identity for this install (default). credential = let the gateway resolve it from the token's memory_identity pin. host = derive per turn from the OpenClaw sender/session (multi-user hosts).",
+    },
+    "memory.identity": {
+      label: "Memory Identity",
+      advanced: true,
+      help: "Identity value used when identityFrom is 'static' (default: 'default'), and the tool-call fallback when identityFrom is 'host'.",
+    },
+    "memory.autoCreate": {
+      label: "Auto-Create Memory Object",
+      advanced: true,
+      help: "Create the memory object on first use when the gateway supports it but the object does not exist yet.",
+    },
+    "memory.requireIsolation": {
+      label: "Require Identity Isolation",
+      advanced: true,
+      help: "Fail startup rather than fall back to the legacy backend when per-identity isolation was requested. The legacy MEMORY_* namespace is shared by every identity.",
+    },
+    "memory.tokenBudget": {
+      label: "Recall Token Budget",
+      advanced: true,
+      help: "token_budget passed to RECALL when injecting memory context into a prompt (default 512).",
+    },
+    "memory.sourceType": {
+      label: "Memory Source Type",
+      advanced: true,
+      help: "Claim authority recorded for memories written via memory_store (default user_statement). Higher authority wins conflicts: system_of_record > verified_user_statement > user_statement > tool_result > agent_derivation > agent_inference.",
     },
     autoCapture: {
       label: "Auto-Capture",

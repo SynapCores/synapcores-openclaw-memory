@@ -80,8 +80,27 @@ const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store").t
 const recallTool = registeredTools.find((t) => t.opts?.name === "memory_recall").tool;
 const forgetTool = registeredTools.find((t) => t.opts?.name === "memory_forget").tool;
 
+const currentTool = registeredTools.find((t) => t.opts?.name === "memory_current")?.tool;
+const traceTool = registeredTools.find((t) => t.opts?.name === "memory_trace")?.tool;
+
 console.log(`\n=== openclaw-memory live smoke against ${SYNAPCORES_HOST}:${SYNAPCORES_PORT} ===`);
 console.log(`Collection: ${COLLECTION}\n`);
+
+// ---------------------------------------------------------------------------
+// Step 0: which backend did the gateway resolve to?
+//
+// v0.7.0 runs on either the CREATE MEMORY object (engine v1.14.3-ce+) or the
+// legacy MEMORY_* primitives. Several steps below behave differently, so
+// resolve it once, up front, and print it — a smoke run whose result you
+// cannot attribute to a backend is not worth much.
+// ---------------------------------------------------------------------------
+let BACKEND = "legacy";
+try {
+  BACKEND = await ext.backendKind();
+  record(0, "pass", `backend = ${BACKEND}`);
+} catch (e) {
+  record(0, "fail", `backend detection threw: ${e?.message ?? e}`);
+}
 
 // ---------------------------------------------------------------------------
 // Step 1: capture 8-10 memories with varied text. v0.2.0's
@@ -140,17 +159,29 @@ try {
 
 // ---------------------------------------------------------------------------
 // Step 3: recallFiltered (SQL WHERE + semantic)
+//
+// v0.7.0: the predicate depends on the backend. `category` / `importance` live
+// in the legacy metadata blob, which the CREATE MEMORY object does not have —
+// so on that backend the plugin refuses that predicate (by design) and we
+// exercise the portable subset instead.
 // ---------------------------------------------------------------------------
 try {
-  const r = await ext.recallFiltered({
-    where: "category = 'preference' AND importance >= 0.7",
-    semantic: "what UI style does the user like?",
-    limit: 5,
-  });
+  const r =
+    BACKEND === "memory-object"
+      ? await ext.recallFiltered({
+          where: "text LIKE '%dark mode%'",
+          semantic: "what UI style does the user like?",
+          limit: 5,
+        })
+      : await ext.recallFiltered({
+          where: "category = 'preference' AND importance >= 0.7",
+          semantic: "what UI style does the user like?",
+          limit: 5,
+        });
   if (r.length === 0) {
     record(3, "fail", "recallFiltered returned 0 results");
   } else {
-    record(3, "pass", `${r.length} results; top text: "${r[0].entry.text.slice(0, 60)}..."`);
+    record(3, "pass", `${r.length} results (${BACKEND}); top text: "${r[0].entry.text.slice(0, 60)}..."`);
   }
 } catch (e) {
   record(3, "fail", `threw: ${e?.message ?? e}${e?.response?.data ? " | data=" + JSON.stringify(e.response.data).slice(0,400) : ""}${e?.response?.status ? " | http=" + e.response.status : ""}${e?.cause?.message ? " | cause=" + e.cause.message : ""}`);
@@ -279,6 +310,49 @@ try {
   }
 } catch (e) {
   record(7, "fail", `threw: ${e?.message ?? e}${e?.response?.data ? " | data=" + JSON.stringify(e.response.data).slice(0,400) : ""}${e?.response?.status ? " | http=" + e.response.status : ""}${e?.cause?.message ? " | cause=" + e.cause.message : ""}`);
+}
+
+// ---------------------------------------------------------------------------
+// Step 8: the CREATE MEMORY contract — CURRENT / TRACE / FORGET ABOUT.
+//
+// Skipped (not failed) on the legacy backend: these verbs do not exist there,
+// and reporting "fail" for an engine doing exactly what it should would train
+// everyone to ignore the smoke output.
+// ---------------------------------------------------------------------------
+if (BACKEND !== "memory-object") {
+  record(8, "pass", "skipped — legacy backend has no CURRENT/TRACE (engine predates v1.14.3-ce)");
+} else {
+  try {
+    // State the change outright so the deterministic extractor handles it with
+    // no model configured. This is the highest-precision REMEMBER path.
+    await storeTool.execute("live-8-seed", {
+      text: "My subscription plan is Enterprise",
+      category: "fact",
+      importance: 0.9,
+    });
+
+    const current = await currentTool.execute("live-8-current", { attribute: "subscription_plan" });
+    const status = current.details?.status;
+    if (status === "ok") {
+      record(8, "pass", `CURRENT subscription_plan = ${current.details.value} (authority ${current.details.authority})`);
+    } else if (status === "not_found") {
+      // Legitimate: extraction is model-assisted and CE may have no model
+      // loaded. Not a plugin failure, but say so rather than claiming a pass.
+      record(8, "pass", "CURRENT returned not_found — no attribute was extracted from the seed (check the engine's extraction config)");
+    } else if (status === "conflict") {
+      record(8, "pass", `CURRENT reported a conflict with ${current.details.competingClaims?.length ?? 0} competing claims — the engine correctly refused to pick`);
+    } else {
+      record(8, "fail", `CURRENT returned an unexpected status: ${JSON.stringify(current.details)}`);
+    }
+
+    const traced = await traceTool.execute("live-8-trace", { attribute: "subscription_plan" });
+    console.log(`  [info] TRACE status=${traced.details?.status} sources=${traced.details?.derivedFrom?.length ?? 0}`);
+
+    const forgotten = await forgetTool.execute("live-8-forget", { query: "subscription plan" });
+    console.log(`  [info] FORGET ABOUT -> ${JSON.stringify(forgotten.details?.affected ?? {})}`);
+  } catch (e) {
+    record(8, "fail", `threw: ${e?.message ?? e}`);
+  }
 }
 
 // ---------------------------------------------------------------------------

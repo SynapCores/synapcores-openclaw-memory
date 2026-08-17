@@ -164,8 +164,21 @@ AutoML relevance scoring:
 openclaw plugins install clawhub:@synapcores/openclaw-memory
 ```
 
-It reads the same `SYNAPCORES_API_KEY` and talks to the same gateway, so
-anything stored through this skill is already there.
+It reads the same `SYNAPCORES_API_KEY` and talks to the same gateway.
+
+**Whether it reads the same memories depends on the engine version.** From
+plugin v0.7.0 on a gateway running **v1.14.3-ce or newer**, the plugin uses the
+`CREATE MEMORY` object — `REMEMBER` / `RECALL` / `CURRENT` / `FORGET` / `TRACE`,
+backed by `_mem_<name>_*` tables — which is a *different* store from the
+`_memory_<namespace>` table this skill writes to. On older gateways, and
+whenever the plugin is configured with `memory.backend: "legacy"`, both write
+the same table and everything here is shared. Check which one is live:
+
+```bash
+curl -s -H "Authorization: Bearer $SYNAPCORES_API_KEY" "$SYNAPCORES_URL/v1/memory"
+# a JSON array  => the plugin will use the CREATE MEMORY object
+# HTTP 404      => the plugin stays on the MEMORY_* functions this skill uses
+```
 
 ## Troubleshooting
 

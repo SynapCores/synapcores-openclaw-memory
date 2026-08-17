@@ -17,6 +17,13 @@
  *
  * v0.4.0 migrates the core memory ops to `@synapcores/sdk@^0.5.0`'s
  * `client.memory` surface. Requires SynapCores gateway v1.8.5-ce+.
+ *
+ * v0.7.0 adds a SECOND backend alongside that one: the v1.14.3+ `CREATE MEMORY`
+ * object (SRS v1.2) and its five verbs — REMEMBER / RECALL / CURRENT / FORGET /
+ * TRACE — over the gateway's `/v1/memory/*` REST surface. The plugin probes the
+ * gateway once and picks; engines that predate the feature keep running on the
+ * legacy `MEMORY_*` path unchanged. See MIGRATION.md for the full mapping, the
+ * identity design, and what the new backend cannot do.
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
@@ -29,6 +36,7 @@ import type { MemoryRecord } from "@synapcores/sdk";
 import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
+  type MemoryObjectConfig,
   memoryConfigSchema,
 } from "./config.js";
 
@@ -54,7 +62,23 @@ export type MemoryEntry = {
 
 export type MemorySearchResult = {
   entry: MemoryEntry;
+  /**
+   * RELEVANCE — the retrieval score, in [0, 1]. On the legacy backend this is
+   * `MEMORY_RECALL`'s cosine `similarity`; on the memory-object backend it is
+   * the envelope's `relevance`.
+   *
+   * This is NOT confidence. The engine keeps the two apart on purpose
+   * (SRS v1.2): relevance says "this matched your question", confidence says
+   * "the evidence for this claim is strong". A highly relevant historical
+   * statement can be non-authoritative, so the plugin never folds one into the
+   * other — see `confidence` below.
+   */
   score: number;
+  /**
+   * CONFIDENCE — evidence strength in [0, 1], when the backend reports one.
+   * Only the memory-object backend does; legacy rows leave it undefined.
+   */
+  confidence?: number;
 };
 
 /**
@@ -314,8 +338,13 @@ class MemoryDB {
   /**
    * One-time gateway preflight. Lazy — only runs on the first call,
    * matching the v0.3.x init semantics.
+   *
+   * Public since v0.7.0: capability detection runs this BEFORE probing
+   * `/v1/memory`, so "the gateway isn't running" and "the key was rejected"
+   * still produce their actionable messages instead of surfacing as a raw
+   * transport error from the probe.
    */
-  private async ensureReady(): Promise<void> {
+  async ensureReady(): Promise<void> {
     if (this.preflightPromise) {
       return this.preflightPromise;
     }
@@ -417,7 +446,7 @@ class MemoryDB {
       }
       throw err;
     }
-    const predicate = compileWherePredicate(where);
+    const { predicate } = compileWherePredicate(where);
     const filtered = mapRecallRowsRich(result).filter((r) =>
       predicate({ entry: r.result.entry, score: r.result.score, metadata: r.metadata }),
     );
@@ -674,8 +703,27 @@ function isMissingNamespaceError(err: unknown): boolean {
 type WhereRecord = {
   entry: MemoryEntry;
   score: number;
+  /** Evidence strength, when the backend reports one (memory-object only). */
+  confidence?: number;
   metadata: Record<string, unknown> | null;
 };
+
+/**
+ * WHERE fields the memory-object backend can actually supply.
+ *
+ * The object backend stores no free-form metadata (REMEMBER has no `metadata`
+ * option — verified against the engine), so `category` / `importance` /
+ * `createdAt` / `metadata->>'…'` have no source there. `recallFiltered` uses
+ * this set to fail loudly instead of returning a confidently empty result set.
+ */
+const MEMORY_OBJECT_WHERE_FIELDS = new Set([
+  "id",
+  "text",
+  "content",
+  "similarity",
+  "score",
+  "confidence",
+]);
 
 /**
  * Compile a SQL-ish `WHERE` fragment into a JS predicate over a
@@ -695,11 +743,19 @@ type WhereRecord = {
  * A trivial always-true clause (empty or `1=1`) short-circuits to pass-all.
  * Unsupported syntax throws a descriptive error rather than silently
  * returning wrong rows.
+ *
+ * Returns the compiled predicate AND the set of fields it reads, so a caller
+ * can refuse a clause the active backend cannot answer (see
+ * {@link MEMORY_OBJECT_WHERE_FIELDS}) instead of evaluating it against
+ * undefined and returning nothing.
  */
-function compileWherePredicate(where: string): (rec: WhereRecord) => boolean {
+function compileWherePredicate(where: string): {
+  predicate: (rec: WhereRecord) => boolean;
+  fields: string[];
+} {
   const src = (where ?? "").trim();
   if (src === "" || src === "1=1" || src === "1 = 1" || src.toLowerCase() === "true") {
-    return () => true;
+    return { predicate: () => true, fields: [] };
   }
 
   type Tok = { t: string; v: string };
@@ -754,6 +810,7 @@ function compileWherePredicate(where: string): (rec: WhereRecord) => boolean {
       case "id": return rec.entry.id;
       case "similarity":
       case "score": return rec.score;
+      case "confidence": return rec.confidence;
       default:
         return rec.metadata ? rec.metadata[name] : undefined;
     }
@@ -894,7 +951,839 @@ function compileWherePredicate(where: string): (rec: WhereRecord) => boolean {
   if (pos !== tokens.length) {
     throw new Error(`recallFiltered: unexpected trailing tokens in WHERE clause near "${peek()?.v ?? ""}"`);
   }
-  return predicate;
+  // Field tokens are collected from the token stream rather than during the
+  // parse so the two stay in step no matter which grammar branch consumed them.
+  const fields = Array.from(
+    new Set(
+      tokens
+        .filter((t) => t.t === "field")
+        .map((t) => (t.v.startsWith("metadata:") ? t.v : t.v.toLowerCase())),
+    ),
+  );
+  return { predicate, fields };
+}
+
+// ============================================================================
+// CREATE MEMORY backend (SRS v1.2, engine v1.14.3+)
+// ============================================================================
+//
+// The second backend. Where MemoryDB above talks to the flat per-namespace
+// `MEMORY_*` primitives, this one talks to the memory OBJECT: one logical
+// thing with five real tables behind it, addressed by the five agent-facing
+// verbs REMEMBER / RECALL / CURRENT / FORGET / TRACE, every call scoped by an
+// identity.
+//
+// WHY REST AND NOT SQL. The verbs are available as SQL too, but the gateway's
+// `/v1/memory/*` module is where identity isolation is enforced
+// (`resolve_identity`, MEM-SEC-001): a credential carrying a `memory_identity`
+// claim is refused with MEMORY_ACCESS_DENIED before any SQL is composed, and
+// every literal — including the free text of a REMEMBER — is escaped
+// server-side. Composing `REMEMBER … FOR user_id = '…'` in the plugin would
+// move both the escaping and the authorization decision client-side.
+//
+// The gateway wraps every response in its standard `{data, meta}`; the SDK's
+// response interceptor already strips that layer, so `response.data` IS the
+// SRS §5.8 envelope: {status, operation, memory, identity, request_id,
+// generated_at, data, warnings, error}.
+
+/** The SRS §5.8 response envelope. `data` is verb-specific. */
+type MemoryEnvelope = {
+  status?: string;
+  operation?: string;
+  memory?: string;
+  identity?: { field?: string; value?: string } | null;
+  request_id?: string;
+  generated_at?: string;
+  data?: Record<string, unknown> | null;
+  warnings?: unknown[];
+  error?: { code?: string; message?: string; retryable?: boolean } | null;
+};
+
+/** Minimal shape of the SDK's underlying axios instance that we rely on. */
+type HttpLike = {
+  get: (path: string) => Promise<{ data: unknown }>;
+  post: (path: string, body?: unknown) => Promise<{ data: unknown }>;
+};
+
+/**
+ * The gateway refused this identity.
+ *
+ * A credential whose token carries a `memory_identity` claim is PINNED: a
+ * request naming any other identity is refused with HTTP 403 and
+ * `error.code = "MEMORY_ACCESS_DENIED"`. That is an authorization decision
+ * about memory, not a bad API key, and it must never be retried against a
+ * different identity or blurred into "the gateway is unreachable" — so it gets
+ * its own error type and its own message.
+ *
+ * SDK GAP (@synapcores/sdk@0.6.1): `handleError` maps EVERY 403 onto
+ * `AuthenticationError` with `code: "AUTH_ERROR"`, discarding the gateway's
+ * own code. The code survives in the response body, which the SDK does pass
+ * through as `err.details`, so {@link memoryErrorCode} digs it back out.
+ */
+export class MemoryAccessDeniedError extends Error {
+  readonly code = "MEMORY_ACCESS_DENIED";
+  constructor(message: string) {
+    super(message);
+    this.name = "MemoryAccessDeniedError";
+  }
+}
+
+/** The active backend cannot serve this operation (and no silent fallback exists). */
+export class MemoryFeatureUnavailableError extends Error {
+  readonly code = "MEMORY_FEATURE_UNAVAILABLE";
+  constructor(message: string) {
+    super(message);
+    this.name = "MemoryFeatureUnavailableError";
+  }
+}
+
+/**
+ * Recover the gateway's stable memory error code from an SDK error.
+ *
+ * The gateway's error body is `{error: {code, message, fields}, meta}` and the
+ * SDK stores the whole body on `err.details` when it has nothing more specific
+ * — so `details.error.code` is where MEMORY_ACCESS_DENIED / MEMORY_NOT_FOUND /
+ * missing_field actually live. `err.code` is the SDK's own coarse class
+ * ("AUTH_ERROR", "NOT_FOUND", …) and is only used as a fallback.
+ */
+function memoryErrorCode(err: unknown): string | undefined {
+  const e = err as { code?: string; details?: { error?: { code?: string } } };
+  return e?.details?.error?.code ?? e?.code;
+}
+
+/** Single-quote-escape a value for a SQL string literal (engine convention: '' ). */
+function sqlLiteral(value: string): string {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+/**
+ * Where a call's memory identity comes from, resolved once at registration.
+ *
+ * See MIGRATION.md §3 for the reasoning. The short version: OpenClaw tool
+ * `execute()` handlers get no session or user context (the host's signature is
+ * `(toolCallId, params, signal?, onUpdate?)`), so deriving a per-user identity
+ * in a hook and caching it for a later tool call would be a race — and losing
+ * that race means one user reading another user's memory. This resolver
+ * therefore never guesses: it returns an identity it can justify, or it throws.
+ */
+class IdentityResolver {
+  constructor(private readonly cfg: MemoryObjectConfig) {}
+
+  get source(): MemoryObjectConfig["identityFrom"] {
+    return this.cfg.identityFrom;
+  }
+
+  /**
+   * Identity for a call with no host context (tools, CLI).
+   *
+   * `undefined` is a real answer, not a failure: in `credential` mode the
+   * plugin deliberately names no identity and lets the gateway resolve the
+   * token's pin.
+   */
+  forTool(operation: string): string | undefined {
+    if (this.cfg.identityFrom === "credential") {
+      return undefined;
+    }
+    const identity = this.cfg.identity;
+    if (identity) {
+      return normalizeIdentity(identity);
+    }
+    throw new MemoryFeatureUnavailableError(
+      `memory-synapcores: ${operation} cannot resolve a memory identity. ` +
+        `memory.identityFrom is "${this.cfg.identityFrom}", but OpenClaw tool calls carry no ` +
+        "session or user context, so there is nothing to derive one from. Set memory.identity " +
+        "to the identity this install should use, or switch memory.identityFrom to " +
+        '"credential" and use a token pinned to one identity.',
+    );
+  }
+
+  /**
+   * Identity for a hook-driven call. `ctx` is OpenClaw's
+   * PluginHookAgentContext, the only place the host hands a plugin a caller
+   * identity. Returns `null` when `host` mode has nothing usable — the caller
+   * must SKIP the operation rather than fall back to a shared bucket.
+   */
+  forHook(ctx: unknown, operation: string): string | undefined | null {
+    if (this.cfg.identityFrom !== "host") {
+      try {
+        return this.forTool(operation);
+      } catch {
+        return null;
+      }
+    }
+    const c = (ctx ?? {}) as Record<string, unknown>;
+    for (const key of ["senderId", "accountId", "sessionKey", "sessionId"]) {
+      const raw = c[key];
+      if (typeof raw === "string" && raw.trim().length > 0) {
+        return normalizeIdentity(raw);
+      }
+    }
+    // Explicitly configured static fallback, if the operator set one.
+    return this.cfg.identity ? normalizeIdentity(this.cfg.identity) : null;
+  }
+}
+
+/**
+ * Normalize an identity value. The engine treats it as an opaque string and
+ * escapes it itself, so this only trims and bounds it — a 4 KB session key in
+ * every row helps nobody.
+ */
+function normalizeIdentity(value: string): string {
+  const trimmed = String(value).trim();
+  return trimmed.length > 128 ? trimmed.slice(0, 128) : trimmed;
+}
+
+/** Result of `REMEMBER` — one episode plus whatever the engine derived from it. */
+export type RememberResult = {
+  /**
+   * The episode id. REMEMBER also returns `memory_ids` for the derived facts,
+   * but the episode is the thing `FORGET … MEMORY '<id>'` and the graph node
+   * key have to agree on, so it is the id the plugin reports.
+   */
+  id: string;
+  memoryIds: string[];
+  changes: Record<string, number>;
+  status: string;
+};
+
+/**
+ * Thin client for the memory object's REST contract.
+ *
+ * Every method returns the envelope's `data` (or the envelope itself where the
+ * status matters), and lets error envelopes surface as thrown SDK errors that
+ * {@link memoryErrorCode} can classify.
+ */
+class MemoryObjectDB {
+  constructor(
+    private readonly client: SynapCores,
+    private readonly memoryName: string,
+  ) {}
+
+  get name(): string {
+    return this.memoryName;
+  }
+
+  private http(): HttpLike {
+    return (
+      this.client as unknown as { _getHttpClient: () => HttpLike }
+    )._getHttpClient();
+  }
+
+  /** `identity: undefined` means "let the gateway resolve the credential's pin". */
+  private scope(identity: string | undefined): Record<string, unknown> {
+    return identity === undefined ? {} : { identity };
+  }
+
+  private async call(
+    path: string,
+    body: Record<string, unknown>,
+    operation: string,
+    identity: string | undefined,
+  ): Promise<MemoryEnvelope> {
+    try {
+      const response = await this.http().post(path, body);
+      return (response?.data ?? {}) as MemoryEnvelope;
+    } catch (err) {
+      throw translateMemoryError(err, operation, identity);
+    }
+  }
+
+  /**
+   * `SHOW MEMORIES` — the capability probe.
+   *
+   * Uses `/memory` WITHOUT a trailing slash: `/v1/memory/` misses the route and
+   * lands on the SPA fallback (404), which would read as "feature absent" on an
+   * engine that has it.
+   */
+  async listMemories(): Promise<Array<Record<string, unknown>>> {
+    const response = await this.http().get("/memory");
+    const body = response?.data;
+    // Shape check, not just status check: an older gateway whose SPA fallback
+    // answered 200 for an unrouted /v1 path would otherwise look like support.
+    return Array.isArray(body) ? (body as Array<Record<string, unknown>>) : [];
+  }
+
+  /** `CREATE MEMORY <name> IDENTITY <field>` — every other option left at the engine's defaults. */
+  async createMemory(identityField: string): Promise<MemoryEnvelope> {
+    const response = await this.http().post("/memory", {
+      name: this.memoryName,
+      identity_field: identityField,
+    });
+    return (response?.data ?? {}) as MemoryEnvelope;
+  }
+
+  async remember(
+    identity: string | undefined,
+    content: string,
+    options: Record<string, unknown> = {},
+  ): Promise<RememberResult> {
+    const envelope = await this.call(
+      `/memory/${this.memoryName}/remember`,
+      { ...this.scope(identity), content, options },
+      "REMEMBER",
+      identity,
+    );
+    const data = (envelope.data ?? {}) as Record<string, unknown>;
+    return {
+      id: typeof data.episode_id === "string" ? data.episode_id : "",
+      memoryIds: Array.isArray(data.memory_ids) ? (data.memory_ids as string[]) : [],
+      changes: (data.changes ?? {}) as Record<string, number>,
+      status: envelope.status ?? "accepted",
+    };
+  }
+
+  async recall(
+    identity: string | undefined,
+    about: string,
+    options: Record<string, unknown> = {},
+  ): Promise<MemoryEnvelope> {
+    return this.call(
+      `/memory/${this.memoryName}/recall`,
+      { ...this.scope(identity), about, options },
+      "RECALL",
+      identity,
+    );
+  }
+
+  async current(identity: string | undefined, attribute: string): Promise<MemoryEnvelope> {
+    return this.call(
+      `/memory/${this.memoryName}/current`,
+      { ...this.scope(identity), attribute },
+      "CURRENT",
+      identity,
+    );
+  }
+
+  async trace(identity: string | undefined, attribute: string): Promise<MemoryEnvelope> {
+    return this.call(
+      `/memory/${this.memoryName}/trace`,
+      { ...this.scope(identity), attribute },
+      "TRACE",
+      identity,
+    );
+  }
+
+  /**
+   * `FORGET` — explicit, authorized removal. Exactly one target; the gateway
+   * refuses an ambiguous FORGET rather than resolving it by precedence.
+   */
+  async forget(
+    identity: string | undefined,
+    target: { memoryId?: string; about?: string; attribute?: string },
+  ): Promise<MemoryEnvelope> {
+    const body: Record<string, unknown> = { ...this.scope(identity) };
+    if (target.memoryId) body.memory_id = target.memoryId;
+    else if (target.about) body.about = target.about;
+    else if (target.attribute) body.attribute = target.attribute;
+    return this.call(`/memory/${this.memoryName}/forget`, body, "FORGET", identity);
+  }
+
+  /**
+   * `CONSOLIDATE` — optional control, never a prerequisite.
+   *
+   * Deliberately NOT a model-facing tool. The engine runs consolidation on its
+   * own schedule and current state is already correct the moment REMEMBER
+   * returns; the manual is explicit that reaching for CONSOLIDATE to make an
+   * answer correct is a bug worth reporting. This exists for tests, for a
+   * bulk import, and for "run a report right now".
+   */
+  async consolidate(identity: string | undefined): Promise<MemoryEnvelope> {
+    return this.call(
+      `/memory/${this.memoryName}/consolidate`,
+      this.scope(identity),
+      "CONSOLIDATE",
+      identity,
+    );
+  }
+
+  /**
+   * Count this identity's episodes.
+   *
+   * There is no COUNT verb; the memory object materializes five ORDINARY
+   * tables (`_mem_<name>_{episodes,facts,state,prov,rels}`) that the manual
+   * documents as directly SELECT-able, so this reads the episodes table. With
+   * a credential-pinned identity (identity unknown client-side) it counts the
+   * whole tenant-visible object instead of one identity.
+   */
+  async count(identity: string | undefined): Promise<number> {
+    const where = identity === undefined ? "" : ` WHERE identity = ${sqlLiteral(identity)}`;
+    try {
+      const result = await this.client.executeQuery({
+        sql: `SELECT COUNT(*) FROM _mem_${this.memoryName}_episodes${where}`,
+      });
+      const first = (result.rows as unknown[][] | undefined)?.[0];
+      const raw = Array.isArray(first) ? first[0] : undefined;
+      if (typeof raw === "number") return raw;
+      if (typeof raw === "string") {
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : 0;
+      }
+      return 0;
+    } catch {
+      // Object exists but has never been written to — no rows, no table yet.
+      return 0;
+    }
+  }
+
+  /**
+   * Fetch one episode by id, for callers that hydrate a memory from an id
+   * (`trainRelevanceModel`). Same reasoning as `count`: the episodes table is
+   * public. `importance` / `category` come back at their defaults because the
+   * memory object stores no free-form metadata (see MIGRATION.md §6).
+   */
+  async get(id: string, identity: string | undefined): Promise<MemoryEntry | null> {
+    if (typeof id !== "string" || id.length === 0) return null;
+    const scope = identity === undefined ? "" : ` AND identity = ${sqlLiteral(identity)}`;
+    try {
+      const result = await this.client.executeQuery({
+        sql:
+          `SELECT id, content, recorded_at FROM _mem_${this.memoryName}_episodes ` +
+          `WHERE id = ${sqlLiteral(id)}${scope} LIMIT 1`,
+      });
+      const row = (result.rows as unknown[][] | undefined)?.[0];
+      if (!Array.isArray(row)) return null;
+      return {
+        id: String(row[0] ?? id),
+        text: String(row[1] ?? ""),
+        vector: [],
+        importance: 0,
+        category: "other",
+        createdAt: parseTimestampMs(row[2]),
+      };
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
+ * Turn an SDK transport error into something a caller can branch on.
+ *
+ * The one case that must not be generic is the identity refusal: a pinned
+ * credential naming another identity is a 403 the SDK flattens into
+ * `AuthenticationError`, which is otherwise indistinguishable from a bad API
+ * key. `missing_field` gets the same treatment for the opposite reason — it is
+ * what an UNPINNED credential gets back in `credential` mode, and the fix is a
+ * config change, not a retry.
+ */
+function translateMemoryError(
+  err: unknown,
+  operation: string,
+  identity: string | undefined,
+): unknown {
+  const code = memoryErrorCode(err);
+  if (code === "MEMORY_ACCESS_DENIED") {
+    return new MemoryAccessDeniedError(
+      `memory-synapcores: the gateway refused ${operation} for memory identity ` +
+        `${identity === undefined ? "(credential pin)" : `'${identity}'`}: this credential is ` +
+        "pinned to a different identity (MEMORY_ACCESS_DENIED). Either use a token pinned to " +
+        'this identity, or set memory.identityFrom: "credential" so the gateway resolves the ' +
+        "pin itself instead of the plugin naming one.",
+    );
+  }
+  if (code === "missing_field" && identity === undefined) {
+    return new MemoryFeatureUnavailableError(
+      `memory-synapcores: ${operation} sent no identity because memory.identityFrom is ` +
+        '"credential", but the gateway says this credential carries no memory_identity pin ' +
+        "(API keys and service tokens are never pinned). Either use a pinned JWT, or set " +
+        'memory.identityFrom: "static" with memory.identity.',
+    );
+  }
+  return err;
+}
+
+/**
+ * Map a RECALL envelope onto the plugin's flat `MemorySearchResult[]`.
+ *
+ * Semantic facts come first, then episodes: the facts are the engine's
+ * distilled claims and the episodes are the verbatim statements the legacy
+ * backend used to return, so a caller that only reads the first N still gets
+ * the more useful half. `relevance` -> `score`, `confidence` stays its own
+ * field — the two are never merged.
+ *
+ * `current_state` is DELIBERATELY not folded in here. It is authoritative and
+ * the whole point of the envelope's shape is that a model does not have to
+ * guess which similar-looking string is the current one; callers that want it
+ * read `data.current_state` (or `memory_current`) directly.
+ */
+function recallEnvelopeToResults(envelope: MemoryEnvelope): MemorySearchResult[] {
+  const data = (envelope.data ?? {}) as Record<string, unknown>;
+  const out: MemorySearchResult[] = [];
+  const seen = new Set<string>();
+
+  const push = (
+    id: string,
+    text: string,
+    relevance: unknown,
+    confidence: unknown,
+    when: unknown,
+  ): void => {
+    if (!text || seen.has(id)) return;
+    seen.add(id);
+    out.push({
+      entry: {
+        id,
+        text,
+        vector: [],
+        // The memory object stores no free-form metadata, so these have no
+        // source on this backend — see MIGRATION.md §6.
+        importance: 0,
+        category: "other",
+        createdAt: parseTimestampMs(when),
+      },
+      score: clamp01(toFiniteNumber(relevance)),
+      ...(typeof confidence === "number" ? { confidence: clamp01(confidence) } : {}),
+    });
+  };
+
+  for (const raw of Array.isArray(data.semantic) ? data.semantic : []) {
+    const f = (raw ?? {}) as Record<string, unknown>;
+    push(
+      String(f.memory_id ?? ""),
+      String(f.fact ?? ""),
+      f.relevance,
+      f.confidence,
+      f.valid_from,
+    );
+  }
+  for (const raw of Array.isArray(data.episodic) ? data.episodic : []) {
+    const e = (raw ?? {}) as Record<string, unknown>;
+    push(
+      String(e.episode_id ?? ""),
+      String(e.event ?? ""),
+      e.relevance,
+      e.confidence,
+      e.occurred_at ?? e.recorded_at,
+    );
+  }
+  return out.sort((a, b) => b.score - a.score);
+}
+
+/**
+ * Which backend is live, and everything the plugin needs to know about it.
+ */
+export type MemoryBackendKind = "legacy" | "memory-object";
+
+/**
+ * Routes every memory operation to whichever backend this gateway supports.
+ *
+ * Detection runs ONCE, lazily, on the first memory operation (matching the
+ * existing gateway-preflight semantics — nothing hits the network at
+ * `register()` time), and the answer is memoized for the life of the plugin.
+ */
+class MemoryRouter {
+  private resolution: Promise<MemoryBackendKind> | null = null;
+  private resolvedKind: MemoryBackendKind | null = null;
+  private warnedNoIsolation = false;
+
+  constructor(
+    private readonly legacy: MemoryDB,
+    private readonly objectDb: MemoryObjectDB,
+    private readonly cfg: MemoryObjectConfig,
+    private readonly identities: IdentityResolver,
+    private readonly logger: {
+      info?: (msg: string) => void;
+      warn?: (msg: string) => void;
+      debug?: (msg: string) => void;
+    },
+  ) {}
+
+  /** The resolved backend, or null before the first operation. */
+  get kindIfKnown(): MemoryBackendKind | null {
+    return this.resolvedKind;
+  }
+
+  get memoryName(): string {
+    return this.objectDb.name;
+  }
+
+  async kind(): Promise<MemoryBackendKind> {
+    if (!this.resolution) {
+      this.resolution = this.detect().catch((err) => {
+        // Reset so a transient failure (gateway restarting) can be retried,
+        // exactly like the preflight promise in MemoryDB.
+        this.resolution = null;
+        throw err;
+      });
+    }
+    return this.resolution;
+  }
+
+  private async detect(): Promise<MemoryBackendKind> {
+    if (this.cfg.backend === "legacy") {
+      return this.settle("legacy", "memory.backend = legacy (configured)");
+    }
+
+    const forced = this.cfg.backend === "memory-object";
+
+    // A memory-object name is an IDENTIFIER on the engine side (it becomes part
+    // of five physical table names), held to ^[A-Za-z_][A-Za-z0-9_]*$ and 64
+    // characters. A longer `collection` is legacy-only.
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(this.objectDb.name) || this.objectDb.name.length > 64) {
+      const why =
+        `memory object name '${this.objectDb.name}' is not a valid engine identifier ` +
+        "(must match ^[A-Za-z_][A-Za-z0-9_]* and be at most 64 characters)";
+      if (forced) {
+        throw new MemoryFeatureUnavailableError(`memory-synapcores: ${why}. Set memory.name.`);
+      }
+      return this.settle("legacy", why);
+    }
+
+    // Preflight first: a down gateway or a rejected key must produce the
+    // actionable message, not a raw transport error from the capability probe
+    // (and definitely not a silent drop to the legacy backend).
+    await this.legacy.ensureReady();
+
+    let objects: Array<Record<string, unknown>>;
+    try {
+      objects = await this.objectDb.listMemories();
+    } catch (err) {
+      // An auth or connection failure is NOT a capability signal. Dropping to
+      // the legacy backend here would hide a wrong API key behind a backend
+      // that fails the same way one call later.
+      const kind = classifyGatewayError(err);
+      if (kind === "auth" || kind === "connection") {
+        throw err;
+      }
+      if (forced) {
+        throw new MemoryFeatureUnavailableError(
+          "memory-synapcores: memory.backend = memory-object, but this gateway does not serve " +
+            `/v1/memory (${String((err as { message?: string })?.message ?? err)}). ` +
+            "The CREATE MEMORY object requires SynapCores engine v1.14.3+.",
+        );
+      }
+      return this.settle(
+        "legacy",
+        "gateway does not serve /v1/memory (engine predates CREATE MEMORY / v1.14.3)",
+      );
+    }
+
+    const existing = objects.find((o) => o?.memory_name === this.objectDb.name);
+    if (!existing) {
+      if (!this.cfg.autoCreate) {
+        const why = `memory object '${this.objectDb.name}' does not exist and memory.autoCreate is off`;
+        if (forced) throw new MemoryFeatureUnavailableError(`memory-synapcores: ${why}`);
+        return this.settle("legacy", why);
+      }
+      try {
+        await this.objectDb.createMemory(this.cfg.identityField);
+        this.logger.info?.(
+          `memory-synapcores: created memory object '${this.objectDb.name}' IDENTITY ${this.cfg.identityField}`,
+        );
+      } catch (err) {
+        // Another OpenClaw instance won the race — that is success, not failure.
+        if (memoryErrorCode(err) !== "MEMORY_ALREADY_EXISTS") {
+          const why = `could not create memory object '${this.objectDb.name}': ${String(
+            (err as { message?: string })?.message ?? err,
+          )}`;
+          if (forced) throw new MemoryFeatureUnavailableError(`memory-synapcores: ${why}`);
+          return this.settle("legacy", why);
+        }
+      }
+    }
+
+    const identityField = String(existing?.identity_field ?? this.cfg.identityField);
+    return this.settle(
+      "memory-object",
+      `object '${this.objectDb.name}', IDENTITY ${identityField}, identity source: ${this.identities.source}`,
+    );
+  }
+
+  private settle(kind: MemoryBackendKind, detail: string): MemoryBackendKind {
+    this.resolvedKind = kind;
+    this.logger.info?.(
+      kind === "memory-object"
+        ? `memory-synapcores: memory backend = memory-object (${detail})`
+        : `memory-synapcores: memory backend = legacy MEMORY_* namespace (${detail})`,
+    );
+    if (kind === "legacy" && this.cfg.identityFrom !== "static") {
+      const message =
+        `memory-synapcores: memory.identityFrom = "${this.cfg.identityFrom}" asks for per-identity ` +
+        "isolation, but the legacy MEMORY_* backend has no identity dimension — every identity " +
+        `shares the namespace '${this.legacy.ns}'. Upgrade the engine to v1.14.3+ for real ` +
+        "isolation, or set memory.identityFrom: \"static\" to say so explicitly.";
+      if (this.cfg.requireIsolation) {
+        throw new MemoryFeatureUnavailableError(
+          `${message} (memory.requireIsolation is on, so this is fatal.)`,
+        );
+      }
+      if (!this.warnedNoIsolation) {
+        this.warnedNoIsolation = true;
+        this.logger.warn?.(message);
+      }
+    }
+    return kind;
+  }
+
+  // -- operations -----------------------------------------------------------
+
+  async store(
+    entry: Omit<MemoryEntry, "id" | "createdAt">,
+    identity: string | undefined,
+    sourceType: string,
+  ): Promise<{ id: string; createdAt: number; changes?: Record<string, number>; status?: string }> {
+    if ((await this.kind()) === "legacy") {
+      const stored = await this.legacy.store(entry);
+      return { id: stored.id, createdAt: stored.createdAt };
+    }
+    // No client-side dedup probe: deduplication, supersession and conflict
+    // policy are the engine's job on this backend (SRS v1.2 — "the engine owns
+    // the lifecycle"), and a second-guessing similarity check here would both
+    // cost a round-trip and contradict the engine's supersession logic.
+    const result = await this.objectDb.remember(identity, entry.text, {
+      source_type: sourceType,
+    });
+    return {
+      id: result.id,
+      createdAt: Date.now(),
+      changes: result.changes,
+      status: result.status,
+    };
+  }
+
+  async searchByQuery(
+    query: string,
+    limit: number,
+    minScore: number,
+    identity: string | undefined,
+  ): Promise<MemorySearchResult[]> {
+    if ((await this.kind()) === "legacy") {
+      return this.legacy.searchByQuery(query, limit, minScore);
+    }
+    const envelope = await this.objectDb.recall(identity, query, {
+      episodes: limit,
+      facts: limit,
+      prompt_ready: false,
+    });
+    return recallEnvelopeToResults(envelope)
+      .filter((r) => r.score >= minScore)
+      .slice(0, limit);
+  }
+
+  /**
+   * Assemble prompt context.
+   *
+   * On the memory-object backend this returns the engine's own
+   * `context.prompt_ready` projection rather than a hand-assembled join: the
+   * engine already knows which claim is authoritative, keeps current state
+   * ahead of a semantically-similar older episode, and preserves current state
+   * when the token budget truncates. Re-deriving that client-side from a flat
+   * result list is exactly what the object backend exists to stop.
+   */
+  async recallForPrompt(
+    query: string,
+    identity: string | undefined,
+    limit: number,
+  ): Promise<{
+    promptReady: string | null;
+    truncated: boolean;
+    results: MemorySearchResult[];
+    currentState: Record<string, unknown>;
+  }> {
+    if ((await this.kind()) === "legacy") {
+      const results = await this.legacy.searchByQuery(query, limit, 0.3);
+      return { promptReady: null, truncated: false, results, currentState: {} };
+    }
+    const envelope = await this.objectDb.recall(identity, query, {
+      current: true,
+      episodes: limit,
+      facts: limit,
+      prompt_ready: true,
+      token_budget: this.cfg.tokenBudget,
+    });
+    const data = (envelope.data ?? {}) as Record<string, unknown>;
+    const context = (data.context ?? {}) as Record<string, unknown>;
+    const promptReady =
+      typeof context.prompt_ready === "string" && context.prompt_ready.trim().length > 0
+        ? context.prompt_ready.trim()
+        : null;
+    return {
+      promptReady,
+      truncated: context.truncated === true,
+      results: recallEnvelopeToResults(envelope).slice(0, limit),
+      currentState: (data.current_state ?? {}) as Record<string, unknown>,
+    };
+  }
+
+  async deleteById(
+    id: string,
+    identity: string | undefined,
+  ): Promise<{ deleted: boolean; affected?: Record<string, unknown> }> {
+    if ((await this.kind()) === "legacy") {
+      return { deleted: await this.legacy.delete(id) };
+    }
+    const envelope = await this.objectDb.forget(identity, { memoryId: id });
+    const data = (envelope.data ?? {}) as Record<string, unknown>;
+    return {
+      deleted: envelope.status !== "not_found",
+      affected: (data.affected ?? {}) as Record<string, unknown>,
+    };
+  }
+
+  /**
+   * Forget by free-text scope.
+   *
+   * Legacy has no such verb, so the plugin's search-then-confirm dance stays
+   * there. The object backend has `FORGET … ABOUT`, which resolves the scope
+   * semantically, propagates the removal to derived facts / embeddings /
+   * relationships / current state / provenance, and reports the count per
+   * category — so the caller gets a receipt instead of a guess.
+   */
+  async forgetAbout(
+    scope: string,
+    identity: string | undefined,
+  ): Promise<{ supported: boolean; affected?: Record<string, unknown>; status?: string }> {
+    if ((await this.kind()) === "legacy") {
+      return { supported: false };
+    }
+    const envelope = await this.objectDb.forget(identity, { about: scope });
+    const data = (envelope.data ?? {}) as Record<string, unknown>;
+    return {
+      supported: true,
+      affected: (data.affected ?? {}) as Record<string, unknown>,
+      status: envelope.status,
+    };
+  }
+
+  async count(identity: string | undefined): Promise<number> {
+    if ((await this.kind()) === "legacy") {
+      return this.legacy.count();
+    }
+    return this.objectDb.count(identity);
+  }
+
+  async get(id: string, identity: string | undefined): Promise<MemoryEntry | null> {
+    if ((await this.kind()) === "legacy") {
+      return this.legacy.get(id);
+    }
+    return this.objectDb.get(id, identity);
+  }
+
+  /** `CURRENT` — deterministic state lookup. Throws on the legacy backend. */
+  async current(attribute: string, identity: string | undefined): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("memory_current (CURRENT)");
+    return this.objectDb.current(identity, attribute);
+  }
+
+  /** `TRACE` — why a value is believed. Throws on the legacy backend. */
+  async trace(attribute: string, identity: string | undefined): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("memory_trace (TRACE)");
+    return this.objectDb.trace(identity, attribute);
+  }
+
+  async consolidate(identity: string | undefined): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("consolidateMemory (CONSOLIDATE)");
+    return this.objectDb.consolidate(identity);
+  }
+
+  private async requireObjectBackend(operation: string): Promise<void> {
+    if ((await this.kind()) !== "memory-object") {
+      throw new MemoryFeatureUnavailableError(
+        `memory-synapcores: ${operation} requires the CREATE MEMORY backend ` +
+          "(SynapCores engine v1.14.3+). This gateway is on the legacy MEMORY_* path.",
+      );
+    }
+  }
 }
 
 // ============================================================================
@@ -1021,9 +1910,20 @@ const MEMORY_TRIGGERS = [
   /always|never|important/i,
 ];
 
-/** Extracts plain-text user/assistant turns from a session's `unknown[]` message log. */
-function extractMessageTexts(messages: unknown[]): string[] {
-  const texts: string[] = [];
+/** One extracted conversation turn: the text plus who said it. */
+export type MessageTurn = { role: "user" | "assistant"; text: string };
+
+/**
+ * Extracts plain-text user/assistant turns from a session's `unknown[]`
+ * message log, KEEPING the role.
+ *
+ * The role used to be discarded. It matters now: on the memory-object backend
+ * it becomes the claim's `source_type`, which is the first dimension the
+ * engine's conflict resolution considers — a user's statement should outrank
+ * the assistant's paraphrase of it when the two disagree.
+ */
+function extractMessageTurns(messages: unknown[]): MessageTurn[] {
+  const turns: MessageTurn[] = [];
   for (const msg of messages) {
     if (!msg || typeof msg !== "object") {
       continue;
@@ -1038,7 +1938,7 @@ function extractMessageTexts(messages: unknown[]): string[] {
     const content = msgObj.content;
 
     if (typeof content === "string") {
-      texts.push(content);
+      turns.push({ role, text: content });
       continue;
     }
 
@@ -1052,12 +1952,12 @@ function extractMessageTexts(messages: unknown[]): string[] {
           "text" in block &&
           typeof (block as Record<string, unknown>).text === "string"
         ) {
-          texts.push((block as Record<string, unknown>).text as string);
+          turns.push({ role, text: (block as Record<string, unknown>).text as string });
         }
       }
     }
   }
-  return texts;
+  return turns;
 }
 
 export function shouldCapture(text: string): boolean {
@@ -1353,6 +2253,25 @@ export interface MemorySynapCoresExtensions {
    * @returns The id and name of the trained model.
    */
   trainRelevanceModel(feedback: RelevanceFeedback[]): Promise<{ modelId: string; modelName: string }>;
+
+  /**
+   * Which backend this gateway resolved to — `"memory-object"` (engine
+   * v1.14.3+ `CREATE MEMORY`) or `"legacy"` (the flat `MEMORY_*` namespace).
+   * Runs capability detection on first call and memoizes the answer.
+   */
+  backendKind(): Promise<MemoryBackendKind>;
+
+  /**
+   * Force a consolidation cycle NOW (memory-object backend only).
+   *
+   * Optional control, NEVER a prerequisite: the engine schedules its own
+   * consolidation and current state is already correct the moment a write
+   * returns. This is deliberately NOT exposed as a model-facing tool — memory
+   * correctness must not depend on an agent remembering to call it. Use it in
+   * a test, before a report, or after a bulk import. Throws
+   * {@link MemoryFeatureUnavailableError} on the legacy backend.
+   */
+  consolidateMemory(): Promise<MemoryEnvelope>;
 }
 
 async function ensureCandidateVector(
@@ -1372,6 +2291,8 @@ async function ensureCandidateVector(
 
 function createExtensions(
   db: MemoryDB,
+  router: MemoryRouter,
+  identities: IdentityResolver,
   embeddings: Embeddings,
   client: SynapCores,
   _graphName: string,
@@ -1390,9 +2311,50 @@ function createExtensions(
   }
 
   return {
+    async backendKind(): Promise<MemoryBackendKind> {
+      return router.kind();
+    },
+
+    async consolidateMemory(): Promise<MemoryEnvelope> {
+      return router.consolidate(identities.forTool("consolidateMemory"));
+    },
+
     async recallFiltered(options: RecallFilteredOptions): Promise<MemorySearchResult[]> {
       const limit = options.limit ?? 5;
-      return db.searchFiltered(options.semantic, options.where, limit);
+      if ((await router.kind()) === "legacy") {
+        return db.searchFiltered(options.semantic, options.where, limit);
+      }
+
+      // Memory-object backend: there is no metadata blob to filter on, so a
+      // predicate naming `category` / `importance` / `createdAt` /
+      // `metadata->>'…'` cannot be answered. Returning an empty result set
+      // would look like "nothing matched"; throwing says what is actually
+      // wrong and names both ways out.
+      const { predicate, fields } = compileWherePredicate(options.where);
+      const unsupported = fields.filter((f) => !MEMORY_OBJECT_WHERE_FIELDS.has(f));
+      if (unsupported.length > 0) {
+        throw new MemoryFeatureUnavailableError(
+          `memory-synapcores.recallFiltered: the CREATE MEMORY backend stores no per-memory ` +
+            `metadata, so it cannot filter on ${unsupported.join(", ")}. Filter on one of ` +
+            `${Array.from(MEMORY_OBJECT_WHERE_FIELDS).join(", ")}, or set ` +
+            'memory.backend: "legacy" to keep the metadata-filtering surface.',
+        );
+      }
+
+      const identity = identities.forTool("recallFiltered");
+      // Oversample so the client-side post-filter still has rows to return.
+      const oversample = clampTopK(Math.max(limit * 5, 25));
+      const rows = await router.searchByQuery(options.semantic, oversample, 0, identity);
+      return rows
+        .filter((r) =>
+          predicate({
+            entry: r.entry,
+            score: r.score,
+            confidence: r.confidence,
+            metadata: null,
+          }),
+        )
+        .slice(0, Number(limit));
     },
 
     async recallRelated(
@@ -1611,8 +2573,15 @@ function createExtensions(
         score: number;
       }> = [];
       let missing = 0;
+      // NOTE: on the memory-object backend the hydrated entries carry
+      // importance 0 / category "other", because that backend stores no
+      // per-memory metadata (MIGRATION.md §6). Six of the eight features stay
+      // meaningful (cosine, age, and the one-hot that collapses to
+      // category_other); training still works, but the model is thinner than
+      // the feature list suggests.
+      const identity = identities.forTool("trainRelevanceModel");
       for (const fb of feedback) {
-        const mem = await db.get(fb.memoryId).catch(() => null);
+        const mem = await router.get(fb.memoryId, identity).catch(() => null);
         if (!mem) {
           missing++;
           continue;
@@ -1783,9 +2752,20 @@ const memoryPlugin = {
     }
 
     const db = new MemoryDB(client, namespace);
+    // The memory OBJECT reuses the collection name by default so an operator
+    // has one name to think about, not two. Its validity as an engine
+    // identifier is checked during capability detection, not here — a name the
+    // object backend cannot take is a reason to stay on the legacy path, not a
+    // reason to refuse to load.
+    const memoryObjectName = cfg.memory.name ?? namespace;
+    const objectDb = new MemoryObjectDB(client, memoryObjectName);
+    const identities = new IdentityResolver(cfg.memory);
+    const router = new MemoryRouter(db, objectDb, cfg.memory, identities, api.logger);
     const embeddings = new Embeddings(client);
     const extensions = createExtensions(
       db,
+      router,
+      identities,
       embeddings,
       client,
       cfg.graph!,
@@ -1794,8 +2774,29 @@ const memoryPlugin = {
     const autoLinkSimilar = cfg.autoLinkSimilar !== false;
 
     api.logger.info(
-      `memory-synapcores: plugin registered (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, namespace: ${namespace}, autoLinkSimilar: ${autoLinkSimilar}, lazy init)`,
+      `memory-synapcores: plugin registered (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, namespace: ${namespace}, memory: ${memoryObjectName}, backend: ${cfg.memory.backend}, identity: ${cfg.memory.identityFrom}, autoLinkSimilar: ${autoLinkSimilar}, lazy init)`,
     );
+
+    /**
+     * Render a thrown memory error as a tool result.
+     *
+     * A MEMORY_ACCESS_DENIED refusal and a "this engine is too old" refusal are
+     * both answers the model can act on, so they come back as ordinary tool
+     * output with a stable `details.error` code rather than an exception that
+     * the host renders as a stack trace. Anything else still throws.
+     */
+    const asToolError = (err: unknown) => {
+      if (
+        err instanceof MemoryAccessDeniedError ||
+        err instanceof MemoryFeatureUnavailableError
+      ) {
+        return {
+          content: [{ type: "text" as const, text: err.message }],
+          details: { error: err.code, message: err.message },
+        };
+      }
+      throw err;
+    };
 
     // ========================================================================
     // Tools
@@ -1817,33 +2818,72 @@ const memoryPlugin = {
         async execute(_toolCallId, params) {
           const { query, limit = 5 } = params as { query: string; limit?: number };
 
-          const results = await db.searchByQuery(query, limit, 0.1);
+          let identity: string | undefined;
+          try {
+            identity = identities.forTool("memory_recall");
+          } catch (err) {
+            return asToolError(err);
+          }
 
-          if (results.length === 0) {
+          // On the memory-object backend this is a RECALL: the engine
+          // assembles the context, keeps authoritative current state separate
+          // from similar-looking older episodes, and hands back a
+          // prompt-ready projection. Use it verbatim rather than re-deriving
+          // one from a flat list.
+          let recalled;
+          try {
+            recalled = await router.recallForPrompt(query, identity, limit);
+          } catch (err) {
+            return asToolError(err);
+          }
+          const { promptReady, truncated, results, currentState } = recalled;
+
+          if (results.length === 0 && Object.keys(currentState).length === 0) {
             return {
               content: [{ type: "text", text: "No relevant memories found." }],
               details: { count: 0 },
             };
           }
 
-          const text = results
-            .map(
-              (r, i) =>
-                `${i + 1}. [${r.entry.category}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%)`,
-            )
-            .join("\n");
+          const text =
+            promptReady ??
+            results
+              .map(
+                (r, i) =>
+                  `${i + 1}. [${r.entry.category}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%)`,
+              )
+              .join("\n");
 
+          // `score` is RELEVANCE and `confidence` is EVIDENCE STRENGTH. They
+          // stay separate fields all the way out to the model — collapsing
+          // them is the mistake the envelope's shape exists to prevent.
           const sanitizedResults = results.map((r) => ({
             id: r.entry.id,
             text: r.entry.text,
             category: r.entry.category,
             importance: r.entry.importance,
             score: r.score,
+            ...(r.confidence === undefined ? {} : { confidence: r.confidence }),
           }));
 
           return {
-            content: [{ type: "text", text: `Found ${results.length} memories:\n\n${text}` }],
-            details: { count: results.length, memories: sanitizedResults },
+            content: [
+              {
+                type: "text",
+                text: promptReady
+                  ? `Relevant memory:\n\n${text}`
+                  : `Found ${results.length} memories:\n\n${text}`,
+              },
+            ],
+            details: {
+              count: results.length,
+              memories: sanitizedResults,
+              // Authoritative current state, reported separately from the
+              // similarity-ranked list so the model never has to guess which
+              // of several similar strings is the one that is true now.
+              currentState,
+              truncated,
+            },
           };
         },
       },
@@ -1878,31 +2918,58 @@ const memoryPlugin = {
             category?: MemoryEntry["category"];
           };
 
-          // Check for duplicates via the engine's recall path. The engine
-          // re-embeds `text` internally so we don't have to.
-          const existing = await db.searchByQuery(text, 1, 0.95);
-          if (existing.length > 0) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Similar memory already exists: "${existing[0].entry.text}"`,
-                },
-              ],
-              details: {
-                action: "duplicate",
-                existingId: existing[0].entry.id,
-                existingText: existing[0].entry.text,
-              },
-            };
+          let identity: string | undefined;
+          try {
+            identity = identities.forTool("memory_store");
+          } catch (err) {
+            return asToolError(err);
           }
 
-          const entry = await db.store({
+          // Duplicate suppression is BACKEND-DEPENDENT on purpose.
+          //
+          // Legacy `MEMORY_STORE` is an unconditional insert, so the plugin has
+          // always had to probe for a near-identical memory first. The memory
+          // object owns that policy itself — REMEMBER feeds consolidation,
+          // which collapses duplicate facts, and conflict resolution, which
+          // supersedes contradicted ones — so probing there costs a round-trip
+          // AND second-guesses the engine's supersession logic.
+          if ((await router.kind()) === "legacy") {
+            const existing = await db.searchByQuery(text, 1, 0.95);
+            if (existing.length > 0) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Similar memory already exists: "${existing[0].entry.text}"`,
+                  },
+                ],
+                details: {
+                  action: "duplicate",
+                  existingId: existing[0].entry.id,
+                  existingText: existing[0].entry.text,
+                },
+              };
+            }
+          }
+
+          let stored;
+          try {
+            stored = await router.store(
+              { text, vector: [], importance, category },
+              identity,
+              cfg.memory.sourceType,
+            );
+          } catch (err) {
+            return asToolError(err);
+          }
+          const entry: MemoryEntry = {
+            id: stored.id,
             text,
             vector: [],
             importance,
             category,
-          });
+            createdAt: stored.createdAt,
+          };
 
           // linkSimilarMemories inserts a Memory graph node carrying an
           // engine-native embedded representation (via `client.embed()`) so
@@ -1921,7 +2988,15 @@ const memoryPlugin = {
 
           return {
             content: [{ type: "text", text: `Stored: "${text.slice(0, 100)}..."` }],
-            details: { action: "created", id: entry.id },
+            details: {
+              action: "created",
+              id: entry.id,
+              // What the engine derived from this one statement (facts,
+              // state changes, relationships, supersessions). Legacy stores
+              // report nothing here — there is nothing to derive.
+              ...(stored.changes ? { changes: stored.changes } : {}),
+              ...(stored.status ? { status: stored.status } : {}),
+            },
           };
         },
       },
@@ -1940,15 +3015,64 @@ const memoryPlugin = {
         async execute(_toolCallId, params) {
           const { query, memoryId } = params as { query?: string; memoryId?: string };
 
+          let identity: string | undefined;
+          try {
+            identity = identities.forTool("memory_forget");
+          } catch (err) {
+            return asToolError(err);
+          }
+
           if (memoryId) {
-            await db.delete(memoryId);
+            let removed;
+            try {
+              removed = await router.deleteById(memoryId, identity);
+            } catch (err) {
+              return asToolError(err);
+            }
             return {
               content: [{ type: "text", text: `Memory ${memoryId} forgotten.` }],
-              details: { action: "deleted", id: memoryId },
+              details: {
+                action: "deleted",
+                id: memoryId,
+                // FORGET propagates to derived facts, embeddings,
+                // relationships, current-state values and provenance, and
+                // reports the count per category. Legacy deletes one row.
+                ...(removed.affected ? { affected: removed.affected } : {}),
+              },
             };
           }
 
           if (query) {
+            // The memory object has a real scope-based FORGET: the engine
+            // resolves the scope semantically, propagates the removal, and
+            // returns a receipt. The legacy path has no such verb, which is
+            // why the search-then-confirm dance below still exists for it.
+            let scoped;
+            try {
+              scoped = await router.forgetAbout(query, identity);
+            } catch (err) {
+              return asToolError(err);
+            }
+            if (scoped.supported) {
+              const affected = (scoped.affected ?? {}) as Record<string, unknown>;
+              const total = Object.values(affected).reduce<number>(
+                (sum, v) => sum + (typeof v === "number" ? v : 0),
+                0,
+              );
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      total > 0
+                        ? `Forgot everything about "${query}" (${total} record(s) across episodes, facts, state, relationships and provenance).`
+                        : `Nothing matching "${query}" was stored.`,
+                  },
+                ],
+                details: { action: "forgot_scope", scope: query, affected, status: scoped.status },
+              };
+            }
+
             const results = await db.searchByQuery(query, 5, 0.7);
 
             if (results.length === 0) {
@@ -1997,6 +3121,166 @@ const memoryPlugin = {
       { name: "memory_forget" },
     );
 
+    // ------------------------------------------------------------------------
+    // CREATE MEMORY-only tools (engine v1.14.3+)
+    //
+    // Registered unless the operator has pinned the plugin to the legacy
+    // backend, because capability detection is async and registration is not.
+    // On a legacy gateway they answer with a stable MEMORY_FEATURE_UNAVAILABLE
+    // result instead of failing — the tool contract in openclaw.plugin.json
+    // stays the same whatever the engine turns out to be.
+    // ------------------------------------------------------------------------
+
+    if (cfg.memory.backend !== "legacy") {
+      api.registerTool(
+        {
+          name: "memory_current",
+          label: "Memory Current Value",
+          description:
+            "Look up the CURRENT, authoritative value of one remembered attribute (e.g. " +
+            "subscription_plan, cloud_provider, dietary_restriction). Use this — not " +
+            "memory_recall — whenever you need an exact fact rather than related context: it " +
+            "is a deterministic state lookup, never a similarity search, so it cannot return " +
+            "an outdated value that merely looks similar. It reports one of: the accepted " +
+            "value with its authority and since-when; nothing recorded; or a conflict with " +
+            "both competing claims, which the engine deliberately will not resolve for you.",
+          parameters: Type.Object({
+            attribute: Type.String({
+              description: "Attribute name, e.g. subscription_plan (identifier characters only)",
+            }),
+          }),
+          async execute(_toolCallId, params) {
+            const { attribute } = params as { attribute: string };
+            try {
+              const identity = identities.forTool("memory_current");
+              const envelope = await router.current(attribute, identity);
+              const data = (envelope.data ?? {}) as Record<string, unknown>;
+
+              if (envelope.status === "not_found") {
+                return {
+                  content: [{ type: "text", text: `Nothing is recorded for '${attribute}'.` }],
+                  details: { status: "not_found", attribute, value: null },
+                };
+              }
+              if (envelope.status === "conflict") {
+                // The engine does NOT pick between competing authoritative
+                // claims, and neither does the plugin. Both are handed to the
+                // model so it can ask rather than assert.
+                const claims = Array.isArray(data.competing_claims) ? data.competing_claims : [];
+                const rendered = claims
+                  .map((c) => {
+                    const claim = (c ?? {}) as Record<string, unknown>;
+                    return `- ${String(claim.value)} (${String(claim.authority ?? "unknown authority")}, confidence ${String(claim.confidence ?? "?")})`;
+                  })
+                  .join("\n");
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text:
+                        `'${attribute}' has competing claims that could not be separated by ` +
+                        `authority, time or confidence:\n${rendered}\n` +
+                        "Ask the user which is correct rather than picking one.",
+                    },
+                  ],
+                  details: { status: "conflict", attribute, competingClaims: claims },
+                };
+              }
+
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      `${attribute} = ${String(data.value)} ` +
+                      `(authority: ${String(data.authority ?? "unknown")}, since ${String(data.valid_from ?? "unknown")})`,
+                  },
+                ],
+                details: {
+                  status: envelope.status ?? "ok",
+                  attribute,
+                  value: data.value ?? null,
+                  // Evidence strength, NOT a retrieval score.
+                  confidence: data.confidence ?? null,
+                  authority: data.authority ?? null,
+                  validFrom: data.valid_from ?? null,
+                  sourceMemoryId: data.source_memory_id ?? null,
+                },
+              };
+            } catch (err) {
+              return asToolError(err);
+            }
+          },
+        },
+        { name: "memory_current" },
+      );
+
+      api.registerTool(
+        {
+          name: "memory_trace",
+          label: "Memory Trace",
+          description:
+            "Explain WHY a remembered value is believed: the source statement verbatim, when it " +
+            "was recorded versus when the event happened, how it was extracted, the confidence, " +
+            "and what it superseded. Use it when a fact is disputed, when a decision is " +
+            "high-stakes, or to check yourself before asserting something from memory.",
+          parameters: Type.Object({
+            attribute: Type.String({ description: "Attribute name to explain" }),
+          }),
+          async execute(_toolCallId, params) {
+            const { attribute } = params as { attribute: string };
+            try {
+              const identity = identities.forTool("memory_trace");
+              const envelope = await router.trace(attribute, identity);
+              const data = (envelope.data ?? {}) as Record<string, unknown>;
+              const sources = Array.isArray(data.derived_from) ? data.derived_from : [];
+
+              if (envelope.status === "not_found" || sources.length === 0) {
+                return {
+                  content: [{ type: "text", text: `No provenance recorded for '${attribute}'.` }],
+                  details: { status: envelope.status ?? "not_found", attribute },
+                };
+              }
+
+              const rendered = sources
+                .map((s) => {
+                  const src = (s ?? {}) as Record<string, unknown>;
+                  return (
+                    `- "${String(src.content ?? "")}" ` +
+                    `(${String(src.source_type ?? "unknown source")}, recorded ${String(src.recorded_at ?? "?")}` +
+                    `, event ${String(src.event_time ?? "?")}, via ${String(src.extraction_method ?? "?")})`
+                  );
+                })
+                .join("\n");
+
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      `${attribute} = ${String(data.value)} (confidence ${String(data.confidence ?? "?")}) ` +
+                      `is believed because:\n${rendered}`,
+                  },
+                ],
+                details: {
+                  status: envelope.status ?? "ok",
+                  attribute,
+                  value: data.value ?? null,
+                  confidence: data.confidence ?? null,
+                  derivedFrom: sources,
+                  supersedes: data.supersedes ?? null,
+                  derivation: data.derivation ?? null,
+                },
+              };
+            } catch (err) {
+              return asToolError(err);
+            }
+          },
+        },
+        { name: "memory_trace" },
+      );
+    }
+
     // ========================================================================
     // CLI Commands
     // ========================================================================
@@ -2009,7 +3293,7 @@ const memoryPlugin = {
           .command("list")
           .description("List memories")
           .action(async () => {
-            const count = await db.count();
+            const count = await router.count(identities.forTool("ltm list"));
             console.log(`Total memories: ${count}`);
           });
 
@@ -2019,13 +3303,19 @@ const memoryPlugin = {
           .argument("<query>", "Search query")
           .option("--limit <n>", "Max results", "5")
           .action(async (query, opts) => {
-            const results = await db.searchByQuery(query, parseInt(opts.limit), 0.3);
+            const results = await router.searchByQuery(
+              query,
+              parseInt(opts.limit),
+              0.3,
+              identities.forTool("ltm search"),
+            );
             const output = results.map((r) => ({
               id: r.entry.id,
               text: r.entry.text,
               category: r.entry.category,
               importance: r.entry.importance,
               score: r.score,
+              ...(r.confidence === undefined ? {} : { confidence: r.confidence }),
             }));
             console.log(JSON.stringify(output, null, 2));
           });
@@ -2034,7 +3324,15 @@ const memoryPlugin = {
           .command("stats")
           .description("Show memory statistics")
           .action(async () => {
-            const count = await db.count();
+            const backend = await router.kind();
+            const count = await router.count(identities.forTool("ltm stats"));
+            console.log(`Backend: ${backend}`);
+            if (backend === "memory-object") {
+              console.log(`Memory object: ${router.memoryName}`);
+              console.log(`Identity source: ${identities.source}`);
+            } else {
+              console.log(`Namespace: ${namespace}`);
+            }
             console.log(`Total memories: ${count}`);
           });
       },
@@ -2051,28 +3349,60 @@ const memoryPlugin = {
     // `prompt`, and the result type (PluginHookBeforePromptBuildResult) still
     // exposes `prependContext` — so per-turn recall injection is preserved.
     if (cfg.autoRecall) {
-      api.on("before_prompt_build", async (event) => {
+      // `ctx` is OpenClaw's PluginHookAgentContext — the ONLY place the host
+      // hands a plugin a caller identity (senderId / accountId / sessionKey).
+      // `memory.identityFrom: "host"` reads it here; tools cannot, which is
+      // why they refuse rather than guess (see IdentityResolver).
+      api.on("before_prompt_build", async (event, ctx) => {
         if (!event.prompt || event.prompt.length < 5) {
           return;
         }
 
-        try {
-          const results = await db.searchByQuery(event.prompt, 3, 0.3);
+        const identity = identities.forHook(ctx, "auto-recall");
+        if (identity === null) {
+          // `host` mode with nothing to derive an identity from. Skipping is
+          // the safe answer: the alternative is injecting some other
+          // identity's memories into this user's prompt.
+          api.logger.debug?.(
+            "memory-synapcores: auto-recall skipped — no memory identity in the hook context",
+          );
+          return;
+        }
 
-          if (results.length === 0) {
+        try {
+          const { promptReady, truncated, results } = await router.recallForPrompt(
+            event.prompt,
+            identity,
+            3,
+          );
+
+          // The engine's own projection when we have one: it already ranks
+          // authoritative current state above a semantically similar older
+          // episode, and preserves current state when the budget truncates.
+          const memoryContext =
+            promptReady ??
+            (results.length === 0
+              ? null
+              : results.map((r) => `- [${r.entry.category}] ${r.entry.text}`).join("\n"));
+
+          if (!memoryContext) {
             return;
           }
 
-          const memoryContext = results
-            .map((r) => `- [${r.entry.category}] ${r.entry.text}`)
-            .join("\n");
-
-          api.logger.info?.(`memory-synapcores: injecting ${results.length} memories into context`);
+          api.logger.info?.(
+            `memory-synapcores: injecting memory context (${results.length} record(s)${truncated ? ", truncated to budget" : ""})`,
+          );
 
           return {
             prependContext: `<relevant-memories>\nThe following memories may be relevant to this conversation:\n${memoryContext}\n</relevant-memories>`,
           };
         } catch (err) {
+          if (err instanceof MemoryAccessDeniedError) {
+            // An identity refusal is a configuration problem, not a transient
+            // recall failure — say so instead of burying it in "recall failed".
+            api.logger.warn(`memory-synapcores: auto-recall refused: ${err.message}`);
+            return;
+          }
           api.logger.warn(`memory-synapcores: recall failed: ${String(err)}`);
         }
       });
@@ -2080,37 +3410,64 @@ const memoryPlugin = {
 
     // Auto-capture: analyze and store important information after agent ends
     if (cfg.autoCapture) {
-      api.on("agent_end", async (event) => {
+      api.on("agent_end", async (event, ctx) => {
         if (!event.success || !event.messages || event.messages.length === 0) {
           return;
         }
 
+        const identity = identities.forHook(ctx, "auto-capture");
+        if (identity === null) {
+          api.logger.debug?.(
+            "memory-synapcores: auto-capture skipped — no memory identity in the hook context",
+          );
+          return;
+        }
+
         try {
-          const texts = extractMessageTexts(event.messages);
+          const turns = extractMessageTurns(event.messages);
 
           // Filter for capturable content
-          const toCapture = texts.filter((text) => text && shouldCapture(text));
+          const toCapture = turns.filter((turn) => turn.text && shouldCapture(turn.text));
           if (toCapture.length === 0) {
             return;
           }
 
+          const backend = await router.kind();
+
           // Store each capturable piece (limit to 3 per conversation)
           let stored = 0;
-          for (const text of toCapture.slice(0, 3)) {
+          for (const turn of toCapture.slice(0, 3)) {
+            const text = turn.text;
             const category = detectCategory(text);
 
-            // Check for duplicates (high similarity threshold)
-            const existing = await db.searchByQuery(text, 1, 0.95);
-            if (existing.length > 0) {
-              continue;
+            // Legacy only: `MEMORY_STORE` is an unconditional insert, so the
+            // client has to suppress near-duplicates. The memory object owns
+            // dedup itself (see the memory_store tool).
+            if (backend === "legacy") {
+              const existing = await db.searchByQuery(text, 1, 0.95);
+              if (existing.length > 0) {
+                continue;
+              }
             }
 
-            const entry = await db.store({
+            // Claim authority follows the turn's ROLE. A sentence the user
+            // said is a user_statement; a sentence the assistant produced is
+            // the agent's own derivation, and the engine's conflict
+            // resolution ranks it lower — which is exactly right when the two
+            // disagree.
+            const stored_ = await router.store(
+              { text, vector: [], importance: 0.7, category },
+              identity,
+              turn.role === "user" ? cfg.memory.sourceType : "agent_derivation",
+            );
+            const entry: MemoryEntry = {
+              id: stored_.id,
               text,
               vector: [],
               importance: 0.7,
               category,
-            });
+              createdAt: stored_.createdAt,
+            };
             if (autoLinkSimilar) {
               try {
                 const embedVec = await embeddings.embed(text);
@@ -2128,6 +3485,10 @@ const memoryPlugin = {
             api.logger.info(`memory-synapcores: auto-captured ${stored} memories`);
           }
         } catch (err) {
+          if (err instanceof MemoryAccessDeniedError) {
+            api.logger.warn(`memory-synapcores: auto-capture refused: ${err.message}`);
+            return;
+          }
           api.logger.warn(`memory-synapcores: capture failed: ${String(err)}`);
         }
       });
@@ -2145,8 +3506,21 @@ const memoryPlugin = {
         // bricking the host — memory ops still lazily retry on first use.
         try {
           await preflightGateway(client);
+          // Resolve the backend here too, so `openclaw plugins doctor` and the
+          // startup log answer "which memory subsystem am I actually on?"
+          // without waiting for the first tool call. Non-fatal: memory ops
+          // still detect lazily and retry.
+          const backend = await router.kind().catch((err) => {
+            api.logger.warn(
+              `memory-synapcores: memory backend detection deferred: ${String((err as Error)?.message ?? err)}`,
+            );
+            return null;
+          });
           api.logger.info(
-            `memory-synapcores: initialized (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, namespace: ${namespace}, embeddings: engine-native)`,
+            `memory-synapcores: initialized (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, ` +
+              `backend: ${backend ?? "pending"}, ` +
+              `${backend === "memory-object" ? `memory: ${router.memoryName}, identity: ${identities.source}` : `namespace: ${namespace}`}, ` +
+              "embeddings: engine-native)",
           );
         } catch (err) {
           api.logger.warn(`memory-synapcores: ${String((err as Error)?.message ?? err)}`);
