@@ -170,6 +170,357 @@ class FakeMemoryClient {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fake CREATE MEMORY object (SRS v1.2) behind /v1/memory/*
+// ---------------------------------------------------------------------------
+// Mirrors the shapes a live v1.14.3 gateway returns (captured from a running
+// engine while writing v0.7.0): the {data, meta} wrapper is already stripped by
+// the SDK's response interceptor, so what the plugin sees is the envelope
+// itself — {status, operation, memory, identity, request_id, data, warnings,
+// error}.
+//
+// `supported` defaults to FALSE so every pre-existing test keeps exercising the
+// legacy MEMORY_* path exactly as before; the memory-object tests opt in.
+
+type FakeEpisode = {
+  id: string;
+  identity: string;
+  content: string;
+  sourceType: string;
+  recordedAt: Date;
+  attribute?: string;
+  value?: string;
+};
+
+/** Build an SDK-shaped error: the gateway's real code lives under `details.error.code`. */
+function fakeSdkError(
+  httpish: "auth" | "not_found" | "bad_request",
+  gatewayCode: string,
+  message: string,
+): Error {
+  const err = new Error(message);
+  // @synapcores/sdk maps 403 -> AuthenticationError/AUTH_ERROR and 404 ->
+  // NotFoundError/NOT_FOUND, discarding the gateway's own code — which is
+  // exactly why the plugin has to dig it back out of `details`.
+  const sdkCode =
+    httpish === "auth" ? "AUTH_ERROR" : httpish === "not_found" ? "NOT_FOUND" : "VALIDATION_ERROR";
+  const sdkName =
+    httpish === "auth"
+      ? "AuthenticationError"
+      : httpish === "not_found"
+        ? "NotFoundError"
+        : "ValidationError";
+  return Object.assign(err, {
+    name: sdkName,
+    code: sdkCode,
+    details: { error: { code: gatewayCode, message } },
+  });
+}
+
+class FakeMemoryObjects {
+  /** False = an engine that predates CREATE MEMORY (no /v1/memory route). */
+  public supported = false;
+  /** Simulates a credential whose token carries a `memory_identity` claim. */
+  public identityPin: string | null = null;
+  public createFails = false;
+  public objects = new Map<string, { identity_field: string }>();
+  public episodes: FakeEpisode[] = [];
+  /** `${memory}|${identity}|${attribute}` -> claims. Two claims = a conflict. */
+  public state = new Map<string, Array<{ value: string; confidence: number; authority: string }>>();
+  public calls: Array<{ path: string; body: unknown }> = [];
+
+  private episodeCounter = 0;
+
+  /** The gateway's `resolve_identity` (MEM-SEC-001), reproduced. */
+  private resolveIdentity(supplied: unknown): string {
+    const given = typeof supplied === "string" && supplied.trim() ? supplied.trim() : undefined;
+    if (this.identityPin !== null) {
+      if (given === undefined) return this.identityPin;
+      if (given === this.identityPin) return this.identityPin;
+      throw fakeSdkError(
+        "auth",
+        "MEMORY_ACCESS_DENIED",
+        "Caller is not authorized for this memory identity.",
+      );
+    }
+    if (given === undefined) {
+      throw fakeSdkError("bad_request", "missing_field", "'identity' is required");
+    }
+    return given;
+  }
+
+  private requireObject(name: string): void {
+    if (!this.objects.has(name)) {
+      throw fakeSdkError(
+        "not_found",
+        "MEMORY_NOT_FOUND",
+        `memory object '${name}' does not exist`,
+      );
+    }
+  }
+
+  private envelope(
+    operation: string,
+    name: string,
+    identity: string,
+    status: string,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    data: any,
+  ) {
+    return {
+      status,
+      operation,
+      memory: name,
+      identity: { field: this.objects.get(name)?.identity_field ?? "user_id", value: identity },
+      request_id: `req_${Math.random().toString(16).slice(2, 10)}`,
+      generated_at: new Date().toISOString(),
+      data,
+      warnings: [],
+      error: null,
+    };
+  }
+
+  list(): Array<Record<string, unknown>> {
+    if (!this.supported) {
+      throw fakeSdkError("not_found", "not_found", "Not Found");
+    }
+    return Array.from(this.objects.entries()).map(([memory_name, def]) => ({
+      memory_name,
+      agent: null,
+      identity_field: def.identity_field,
+      episodic: true,
+      semantic: true,
+      temporal: true,
+      relationships: true,
+      provenance: true,
+      consolidation: "AUTO",
+    }));
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  create(body: any) {
+    if (!this.supported) {
+      throw fakeSdkError("not_found", "not_found", "Not Found");
+    }
+    if (this.createFails) {
+      throw fakeSdkError("bad_request", "MEMORY_INVALID_ARGUMENT", "cannot create");
+    }
+    const name = String(body?.name ?? "");
+    if (this.objects.has(name)) {
+      throw fakeSdkError("bad_request", "MEMORY_ALREADY_EXISTS", "already exists");
+    }
+    this.objects.set(name, { identity_field: String(body?.identity_field ?? "user_id") });
+    return this.envelope("CREATE MEMORY", name, "", "completed", {
+      memory: name,
+      identity_field: body?.identity_field,
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  remember(name: string, body: any) {
+    this.requireObject(name);
+    const identity = this.resolveIdentity(body?.identity);
+    const options = (body?.options ?? {}) as Record<string, unknown>;
+    this.episodeCounter += 1;
+    const episode: FakeEpisode = {
+      id: `ep_${this.episodeCounter.toString(16)}_${Math.random().toString(36).slice(2, 8)}`,
+      identity,
+      content: String(body?.content ?? ""),
+      sourceType: String(options.source_type ?? "user_statement"),
+      recordedAt: new Date(),
+      attribute: typeof options.attribute === "string" ? options.attribute : undefined,
+      value: typeof options.value === "string" ? options.value : undefined,
+    };
+    this.episodes.push(episode);
+
+    let stateChanges = 0;
+    if (episode.attribute && episode.value !== undefined) {
+      const key = `${name}|${identity}|${episode.attribute}`;
+      this.state.set(key, [
+        { value: episode.value, confidence: 0.85, authority: episode.sourceType },
+      ]);
+      stateChanges = 1;
+    }
+
+    return this.envelope("REMEMBER", name, identity, "accepted", {
+      episode_id: episode.id,
+      memory_ids: [`mem_${episode.id.slice(3)}`],
+      changes: {
+        episodes_created: 1,
+        facts_created: stateChanges === 1 ? 0 : 1,
+        state_changes: stateChanges,
+        relationships_created: 0,
+        records_superseded: 0,
+        conflicts_flagged: 0,
+      },
+      consolidation: { required: false, status: "not_required" },
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  recall(name: string, body: any) {
+    this.requireObject(name);
+    const identity = this.resolveIdentity(body?.identity);
+    const about = String(body?.about ?? "");
+    const options = (body?.options ?? {}) as Record<string, unknown>;
+    const qVec = deterministicEmbed(about);
+
+    const mine = this.episodes.filter((e) => e.identity === identity);
+    const scored = mine
+      .map((e) => ({ episode: e, relevance: cosineSim(qVec, deterministicEmbed(e.content)) }))
+      .sort((a, b) => b.relevance - a.relevance);
+
+    const currentState: Record<string, unknown> = {};
+    for (const [key, claims] of this.state.entries()) {
+      const [mem, id, attribute] = key.split("|");
+      if (mem !== name || id !== identity || claims.length !== 1) continue;
+      currentState[attribute] = {
+        value: claims[0].value,
+        confidence: claims[0].confidence,
+        valid_from: "2026-08-17 14:02:42",
+      };
+    }
+
+    const semantic = scored
+      .filter((s) => s.episode.attribute)
+      .map((s) => ({
+        memory_id: `mem_${s.episode.id.slice(3)}`,
+        fact: `${s.episode.attribute} is ${s.episode.value}`,
+        attribute: s.episode.attribute,
+        value: s.episode.value,
+        // Deliberately DIFFERENT from relevance so a test can prove the two
+        // are never conflated.
+        confidence: 0.85,
+        relevance: s.relevance,
+      }));
+    const episodic = scored.map((s) => ({
+      episode_id: s.episode.id,
+      event: s.episode.content,
+      occurred_at: s.episode.recordedAt.toISOString(),
+      recorded_at: s.episode.recordedAt.toISOString(),
+      relevance: s.relevance,
+    }));
+
+    const promptReady =
+      options.prompt_ready === false || scored.length === 0
+        ? ""
+        : `ENGINE-PROJECTION: ${scored.map((s) => s.episode.content).join(" | ")}`;
+
+    return this.envelope("RECALL", name, identity, "ok", {
+      query: about,
+      intent: "general",
+      current_state: currentState,
+      semantic,
+      episodic,
+      relationships: [],
+      temporal: [],
+      provenance: [],
+      context: {
+        prompt_ready: promptReady,
+        estimated_tokens: 42,
+        truncated: false,
+      },
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  current(name: string, body: any) {
+    this.requireObject(name);
+    const identity = this.resolveIdentity(body?.identity);
+    const attribute = String(body?.attribute ?? "");
+    const claims = this.state.get(`${name}|${identity}|${attribute}`) ?? [];
+    if (claims.length === 0) {
+      return this.envelope("CURRENT", name, identity, "not_found", { attribute, value: null });
+    }
+    if (claims.length > 1) {
+      // The engine does NOT pick when authority, time and confidence all fail
+      // to separate the claims.
+      return this.envelope("CURRENT", name, identity, "conflict", {
+        attribute,
+        competing_claims: claims,
+      });
+    }
+    return this.envelope("CURRENT", name, identity, "ok", {
+      attribute,
+      value: claims[0].value,
+      confidence: claims[0].confidence,
+      authority: claims[0].authority,
+      valid_from: "2026-08-17 14:02:42",
+      valid_to: null,
+      source_memory_id: "mem_fake",
+      supersedes_memory_id: null,
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  trace(name: string, body: any) {
+    this.requireObject(name);
+    const identity = this.resolveIdentity(body?.identity);
+    const attribute = String(body?.attribute ?? "");
+    const source = this.episodes.find((e) => e.identity === identity && e.attribute === attribute);
+    if (!source) {
+      return this.envelope("TRACE", name, identity, "not_found", { attribute });
+    }
+    return this.envelope("TRACE", name, identity, "ok", {
+      memory_id: `mem_${source.id.slice(3)}`,
+      attribute,
+      value: source.value,
+      confidence: 0.85,
+      derived_from: [
+        {
+          episode_id: source.id,
+          source_type: source.sourceType,
+          content: source.content,
+          recorded_at: source.recordedAt.toISOString(),
+          event_time: source.recordedAt.toISOString(),
+          extraction_method: "explicit_option",
+          extractor_version: "memory_extractor_v1",
+        },
+      ],
+      supersedes: null,
+      derivation: [{ step: 1, operation: "extract_state_candidate" }],
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  forget(name: string, body: any) {
+    this.requireObject(name);
+    const identity = this.resolveIdentity(body?.identity);
+    const before = this.episodes.length;
+    if (typeof body?.memory_id === "string") {
+      this.episodes = this.episodes.filter(
+        (e) => !(e.identity === identity && e.id === body.memory_id),
+      );
+    } else if (typeof body?.about === "string") {
+      const aVec = deterministicEmbed(body.about);
+      this.episodes = this.episodes.filter(
+        (e) => !(e.identity === identity && cosineSim(aVec, deterministicEmbed(e.content)) >= 0.3),
+      );
+    }
+    const removed = before - this.episodes.length;
+    return this.envelope("FORGET", name, identity, removed > 0 ? "completed" : "not_found", {
+      scope: body?.about ?? body?.memory_id,
+      affected: {
+        episodes: removed,
+        semantic_facts: removed,
+        state_records: 0,
+        relationships: 0,
+        embeddings: removed,
+      },
+      propagation_status: "completed",
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  consolidate(name: string, body: any) {
+    this.requireObject(name);
+    const identity = this.resolveIdentity(body?.identity);
+    return this.envelope("CONSOLIDATE", name, identity, "completed", {
+      episodes_processed: this.episodes.filter((e) => e.identity === identity).length,
+    });
+  }
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type CypherCall = { query: string; params?: Record<string, any>; graph?: string };
 type ListModelsResult = Array<{ id: string; name: string; task?: string; status?: string }>;
@@ -299,6 +650,8 @@ class FakeSynapCores {
   public graph = new FakeGraph();
   public automl = new FakeAutoML();
   public readonly memory: FakeMemoryClient;
+  /** The v1.14.3+ CREATE MEMORY object surface. Off unless a test enables it. */
+  public memoryObjects = new FakeMemoryObjects();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public sqlCalls: Array<{ sql: string; parameters?: any[] }> = [];
   // Synthetic in-memory SQL tables for executeQuery
@@ -415,6 +768,41 @@ class FakeSynapCores {
       return { columns: [], rows: [], rows_affected: 1, execution_time_ms: 0 };
     }
 
+    // The memory object materializes five ORDINARY tables; the plugin reads
+    // `_mem_<name>_episodes` for the two things the verb contract has no verb
+    // for — counting, and fetching one memory by id.
+    m = sql.match(/^SELECT COUNT\(\*\) FROM _mem_(\w+)_episodes(?:\s+WHERE identity = '(.*)')?/i);
+    if (m) {
+      const identity = m[2];
+      const rows = this.memoryObjects.episodes.filter(
+        (e) => identity === undefined || e.identity === identity.replace(/''/g, "'"),
+      );
+      return {
+        columns: [{ name: "count", data_type: "INTEGER", nullable: true }],
+        rows: [[rows.length]],
+        execution_time_ms: 0,
+      };
+    }
+    m = sql.match(
+      /^SELECT id, content, recorded_at FROM _mem_(\w+)_episodes WHERE id = '(.*?)'(?:\s+AND identity = '(.*?)')?\s+LIMIT 1/i,
+    );
+    if (m) {
+      const id = m[2].replace(/''/g, "'");
+      const identity = m[3]?.replace(/''/g, "'");
+      const found = this.memoryObjects.episodes.find(
+        (e) => e.id === id && (identity === undefined || e.identity === identity),
+      );
+      return {
+        columns: [
+          { name: "id", data_type: "TEXT", nullable: false },
+          { name: "content", data_type: "TEXT", nullable: false },
+          { name: "recorded_at", data_type: "TEXT", nullable: false },
+        ],
+        rows: found ? [[found.id, found.content, found.recordedAt.toISOString()]] : [],
+        execution_time_ms: 0,
+      };
+    }
+
     // SELECT COUNT(*) FROM <name>
     m = sql.match(/^SELECT COUNT\(\*\) FROM\s+(\w+)/i);
     if (m) {
@@ -448,13 +836,51 @@ class FakeSynapCores {
   // `client.graph.cypher` in older SDK versions). The fake mirrors
   // both paths so the plugin's workarounds round-trip in-process.
   _getHttpClient(): {
+    get: (path: string) => Promise<{ data: unknown }>;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     post: (path: string, body?: any) => Promise<{ data: unknown }>;
   } {
     const self = this;
     return {
+      async get(path: string) {
+        // Capability probe. The plugin must use the UNSLASHED form: a live
+        // gateway 404s `/v1/memory/` (it misses the route and lands on the SPA
+        // fallback) while `/v1/memory` serves SHOW MEMORIES.
+        if (path === "/memory") {
+          self.memoryObjects.calls.push({ path, body: undefined });
+          return { data: self.memoryObjects.list() };
+        }
+        throw new Error(`FakeSynapCores._getHttpClient: unhandled GET ${path}`);
+      },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       async post(path: string, body?: any) {
+        if (path.startsWith("/memory")) {
+          self.memoryObjects.calls.push({ path, body });
+          if (path === "/memory") {
+            return { data: self.memoryObjects.create(body) };
+          }
+          const m = path.match(/^\/memory\/([^/]+)\/(\w+)$/);
+          if (m) {
+            const [, name, verb] = m;
+            switch (verb) {
+              case "remember":
+                return { data: self.memoryObjects.remember(name, body) };
+              case "recall":
+                return { data: self.memoryObjects.recall(name, body) };
+              case "current":
+                return { data: self.memoryObjects.current(name, body) };
+              case "trace":
+                return { data: self.memoryObjects.trace(name, body) };
+              case "forget":
+                return { data: self.memoryObjects.forget(name, body) };
+              case "consolidate":
+                return { data: self.memoryObjects.consolidate(name, body) };
+              default:
+                throw new Error(`FakeSynapCores: unhandled memory verb ${verb}`);
+            }
+          }
+          throw new Error(`FakeSynapCores._getHttpClient: unhandled POST ${path}`);
+        }
         if (path === "/graph/nodes") {
           const labels = Array.isArray(body?.labels) ? body.labels : [];
           const props = body?.properties ?? {};
@@ -741,6 +1167,72 @@ describe("memory plugin metadata", () => {
     expect(config?.autoRecall).toBe(false);
     expect(config?.autoLinkSimilar).toBe(false);
   });
+
+  test("memory block defaults: auto-detect the backend, let the gateway resolve the identity", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const config = memoryPlugin.configSchema?.parse?.({ synapcores: {} }) as
+      | { memory: Record<string, unknown> }
+      | undefined;
+
+    // `credential` is the default because the gateway now mints a
+    // memory_identity pin for ordinary user logins: the plugin sends no
+    // identity and therefore cannot address another one. No identity value is
+    // filled in — inventing one here would make the plugin name an identity it
+    // was specifically told not to name.
+    expect(config?.memory.backend).toBe("auto");
+    expect(config?.memory.identityFrom).toBe("credential");
+    expect(config?.memory.identity).toBeUndefined();
+    expect(config?.memory.identityFromExplicit).toBe(false);
+    expect(config?.memory.identityField).toBe("user_id");
+    expect(config?.memory.autoCreate).toBe(true);
+    expect(config?.memory.requireIsolation).toBe(false);
+    expect(config?.memory.sourceType).toBe("user_statement");
+    expect(config?.memory.tokenBudget).toBe(512);
+  });
+
+  test("memory block rejects unknown keys and bad enum values", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    expect(() =>
+      memoryPlugin.configSchema?.parse?.({ synapcores: {}, memory: { backedn: "auto" } }),
+    ).toThrow(/unknown keys: backedn/);
+    expect(() =>
+      memoryPlugin.configSchema?.parse?.({ synapcores: {}, memory: { backend: "sqlite" } }),
+    ).toThrow(/memory\.backend must be one of/);
+    expect(() =>
+      memoryPlugin.configSchema?.parse?.({ synapcores: {}, memory: { identityFrom: "cookie" } }),
+    ).toThrow(/memory\.identityFrom must be one of/);
+    expect(() =>
+      memoryPlugin.configSchema?.parse?.({ synapcores: {}, memory: { tokenBudget: -1 } }),
+    ).toThrow(/positive integer/);
+  });
+
+  test("memory.identity is left unset for non-static identity sources", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    // `credential` means "the gateway resolves it" — filling in a default here
+    // would make the plugin name an identity it was told not to name.
+    const credential = memoryPlugin.configSchema?.parse?.({
+      synapcores: {},
+      memory: { identityFrom: "credential" },
+    }) as { memory: { identity?: string; identityFromExplicit: boolean } } | undefined;
+    expect(credential?.memory.identity).toBeUndefined();
+    expect(credential?.memory.identityFromExplicit).toBe(true);
+
+    // `static` still fills in the documented default, because it has to
+    // resolve to something and an empty identity is rejected by the engine.
+    const staticMode = memoryPlugin.configSchema?.parse?.({
+      synapcores: {},
+      memory: { identityFrom: "static" },
+    }) as { memory: { identity?: string } } | undefined;
+    expect(staticMode?.memory.identity).toBe("default");
+
+    // `host` derives per turn, but an explicit value is still honoured as the
+    // documented tool-call fallback.
+    const host = memoryPlugin.configSchema?.parse?.({
+      synapcores: {},
+      memory: { identityFrom: "host", identity: "fallback_user" },
+    }) as { memory: { identity?: string } } | undefined;
+    expect(host?.memory.identity).toBe("fallback_user");
+  });
 });
 
 describe("capture filter heuristics", () => {
@@ -902,10 +1394,17 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     memoryPlugin.register(mockApi as any);
 
-    expect(registeredTools.length).toBe(3);
+    // Five tools since 0.7.0: the three legacy ones plus memory_current /
+    // memory_trace, which the CREATE MEMORY backend makes possible. They are
+    // registered up front because capability detection is async and
+    // registration is not; on a legacy gateway they answer with a stable
+    // MEMORY_FEATURE_UNAVAILABLE result.
+    expect(registeredTools.length).toBe(5);
     expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_recall");
     expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_store");
     expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_forget");
+    expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_current");
+    expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_trace");
     expect(registeredClis.length).toBe(1);
     expect(registeredServices.length).toBe(1);
 
@@ -1074,7 +1573,7 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     expect(() => memoryPlugin.register(mockApi as any)).not.toThrow();
     // The rest of registration (tools, etc.) must still complete normally —
     // this is the whole point of the guard.
-    expect(registeredTools.length).toBe(3);
+    expect(registeredTools.length).toBe(5);
   });
 
   test("recallFiltered runs the WHERE clause engine-side against MEMORY_RECALL output (legacy shorthand auto-rewrites)", async () => {
@@ -1444,6 +1943,667 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       memoryPlugin.register(mockApi as any);
     }).toThrow(/valid namespace/);
+  });
+
+  // ==========================================================================
+  // CREATE MEMORY backend (SRS v1.2, engine v1.14.3+)
+  // ==========================================================================
+
+  /**
+   * The identity a pinned user token resolves to. The gateway mints
+   * `memory_identity` = the user's own `sub` for ordinary interactive logins,
+   * so in credential mode this is the value the plugin never names and always
+   * gets.
+   */
+  const PINNED_USER = "user-sub-0001";
+
+  /**
+   * Register the plugin with the memory-object surface switched ON in the
+   * fake gateway. Returns the usual handles plus the fake's memory-object
+   * engine, so a test can inspect what the plugin actually sent.
+   */
+  async function registerWithMemoryObject(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    extraConfig: Record<string, any> = {},
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    tune: (objects: FakeMemoryObjects) => void = () => {},
+  ) {
+    const { default: memoryPlugin } = await import("./index.js");
+    const handles = buildMockApi({ autoLinkSimilar: false, ...extraConfig });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(handles.mockApi as any);
+    const fake = getLastFake();
+    // Detection is lazy — the plugin has not probed yet at this point, so a
+    // test can still decide what the gateway looks like.
+    fake.memoryObjects.supported = true;
+    // The default identity source is `credential`, which only works against a
+    // credential the gateway pins — an ordinary interactive user token. Model
+    // that by default so the common path is the one under test; `static` and
+    // `host` are for UNPINNED credentials (API keys, admin tokens), so they
+    // get no pin. `tune` still overrides either way.
+    const requestedSource = extraConfig.memory?.identityFrom ?? "credential";
+    if (requestedSource === "credential") {
+      fake.memoryObjects.identityPin = PINNED_USER;
+    }
+    tune(fake.memoryObjects);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ext = (memoryPlugin as any).extensions;
+    const tool = (name: string) =>
+      handles.registeredTools.find((t) => t.opts?.name === name)!.tool;
+    return { ...handles, memoryPlugin, fake, ext, tool };
+  }
+
+  test("capability detection: falls back to the legacy backend when the gateway has no /v1/memory", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools, logs } = buildMockApi({ autoLinkSimilar: false });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+    const fake = getLastFake();
+    // `supported` stays false: this is an engine that predates CREATE MEMORY.
+
+    const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")!.tool;
+    const result = await storeTool.execute("c1", { text: "I prefer dark mode for everything" });
+
+    expect(result.details.action).toBe("created");
+    // The write went to the LEGACY primitives, not the memory object.
+    expect(fake.memory.storeCalls.length).toBe(1);
+    expect(fake.memoryObjects.episodes.length).toBe(0);
+    // The probe ran, and only once (memoized).
+    expect(fake.memoryObjects.calls.filter((c) => c.path === "/memory").length).toBe(1);
+    expect(logs.join("\n")).toMatch(/memory backend = legacy MEMORY_\* namespace/);
+  });
+
+  test("capability detection: selects the memory-object backend and CREATEs the object", async () => {
+    const { fake, tool, logs } = await registerWithMemoryObject();
+
+    const result = await tool("memory_store").execute("c1", {
+      text: "I prefer dark mode for everything",
+    });
+
+    expect(result.details.action).toBe("created");
+    expect(result.details.id).toMatch(/^ep_/); // the episode id, not a mem_ id
+    // Nothing went to the legacy namespace.
+    expect(fake.memory.storeCalls.length).toBe(0);
+    expect(fake.memoryObjects.episodes.length).toBe(1);
+    expect(fake.memoryObjects.objects.has("openclaw_memories_test")).toBe(true);
+    expect(fake.memoryObjects.objects.get("openclaw_memories_test")?.identity_field).toBe("user_id");
+    expect(logs.join("\n")).toMatch(/memory backend = memory-object/);
+  });
+
+  test("capability detection: an existing object is adopted, not re-created", async () => {
+    const { fake, tool } = await registerWithMemoryObject({}, (objects) => {
+      objects.objects.set("openclaw_memories_test", { identity_field: "tenant_user" });
+    });
+
+    await tool("memory_store").execute("c1", { text: "I prefer dark mode for everything" });
+
+    // Exactly one catalog probe, no CREATE.
+    const creates = fake.memoryObjects.calls.filter(
+      (c) => c.path === "/memory" && c.body !== undefined,
+    );
+    expect(creates.length).toBe(0);
+    expect(fake.memoryObjects.objects.get("openclaw_memories_test")?.identity_field).toBe(
+      "tenant_user",
+    );
+  });
+
+  test("capability detection: backend 'memory-object' fails loudly instead of falling back", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools } = buildMockApi({
+      autoLinkSimilar: false,
+      memory: { backend: "memory-object" },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+    // supported stays false — the gateway cannot serve it.
+
+    const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")!.tool;
+    const result = await storeTool.execute("c1", { text: "I prefer dark mode for everything" });
+    // Loud, but readable: the model gets a stable code and a message, not a
+    // raw rejection the host renders as a stack trace. Crucially it did NOT
+    // quietly write to the legacy namespace.
+    expect(result.details.error).toBe("MEMORY_FEATURE_UNAVAILABLE");
+    expect(result.content[0].text).toMatch(/requires SynapCores engine v1\.14\.3|does not serve \/v1\/memory/);
+    expect(getLastFake().memory.storeCalls.length).toBe(0);
+  });
+
+  test("capability detection: backend 'legacy' never probes and hides the object-only tools", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools } = buildMockApi({
+      autoLinkSimilar: false,
+      memory: { backend: "legacy" },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+    const fake = getLastFake();
+    fake.memoryObjects.supported = true; // available, but not asked for
+
+    expect(registeredTools.length).toBe(3);
+    expect(registeredTools.map((t) => t.opts?.name)).not.toContain("memory_current");
+
+    const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")!.tool;
+    await storeTool.execute("c1", { text: "I prefer dark mode for everything" });
+    expect(fake.memory.storeCalls.length).toBe(1);
+    expect(fake.memoryObjects.calls.length).toBe(0);
+  });
+
+  test("capability detection: an auth failure is NOT read as 'feature absent'", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: false });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+    const fake = getLastFake();
+    fake.memoryObjects.list = () => {
+      throw fakeSdkError("auth", "unauthorized", "Invalid API key");
+    };
+
+    const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")!.tool;
+    // Silently dropping to the legacy backend here would hide a wrong key
+    // behind a path that fails the same way one call later.
+    await expect(
+      storeTool.execute("c1", { text: "I prefer dark mode for everything" }),
+    ).rejects.toThrow(/Invalid API key/);
+  });
+
+  test("memory_store REMEMBERs without a client-side dedup probe and reports the engine's changes", async () => {
+    const { fake, tool } = await registerWithMemoryObject();
+    const storeTool = tool("memory_store");
+
+    const first = await storeTool.execute("c1", { text: "I prefer dark mode for everything" });
+    const second = await storeTool.execute("c2", { text: "I prefer dark mode for everything" });
+
+    // Deduplication is the ENGINE's job on this backend, so the plugin does
+    // not pre-screen and does not report `duplicate`.
+    expect(first.details.action).toBe("created");
+    expect(second.details.action).toBe("created");
+    expect(fake.memoryObjects.episodes.length).toBe(2);
+    expect(first.details.changes).toMatchObject({ episodes_created: 1 });
+    expect(first.details.status).toBe("accepted");
+    // No legacy recall was issued as a dedup probe.
+    expect(fake.memory.recallCalls.length).toBe(0);
+  });
+
+  test("memory_recall returns the engine's prompt_ready projection and keeps current_state separate", async () => {
+    const { tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", { text: "I prefer dark mode for everything" });
+
+    const result = await tool("memory_recall").execute("c2", {
+      query: "I prefer dark mode for everything",
+      limit: 5,
+    });
+
+    expect(result.content[0].text).toContain("ENGINE-PROJECTION:");
+    expect(result.details.count).toBeGreaterThan(0);
+    // current_state is reported on its own, never merged into the ranked list.
+    expect(result.details).toHaveProperty("currentState");
+    expect(result.details.truncated).toBe(false);
+  });
+
+  test("memory_recall keeps relevance (score) and confidence as separate fields", async () => {
+    const { tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", {
+      text: "My subscription plan is Enterprise",
+    });
+    // Give the identity a state-bearing episode so a semantic fact exists.
+    const { fake } = await Promise.resolve({ fake: getLastFake() });
+    fake.memoryObjects.episodes[0].attribute = "subscription_plan";
+    fake.memoryObjects.episodes[0].value = "Enterprise";
+
+    const result = await tool("memory_recall").execute("c2", {
+      query: "My subscription plan is Enterprise",
+      limit: 5,
+    });
+
+    const withConfidence = result.details.memories.find(
+      (m: { confidence?: number }) => m.confidence !== undefined,
+    );
+    expect(withConfidence).toBeDefined();
+    // The fake pins confidence at 0.85 and derives relevance from cosine, so
+    // equality here would prove the plugin collapsed one into the other.
+    expect(withConfidence.confidence).toBeCloseTo(0.85, 5);
+    expect(withConfidence.score).not.toBeCloseTo(0.85, 5);
+  });
+
+  test("memory_current reports ok / not_found / conflict without guessing", async () => {
+    const { fake, tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", { text: "seed so the object exists" });
+    const currentTool = tool("memory_current");
+
+    // not_found — nothing recorded is an ANSWER, not a failure.
+    const missing = await currentTool.execute("c2", { attribute: "cloud_provider" });
+    expect(missing.details.status).toBe("not_found");
+    expect(missing.details.value).toBeNull();
+
+    // ok
+    fake.memoryObjects.state.set(`openclaw_memories_test|${PINNED_USER}|subscription_plan`, [
+      { value: "Enterprise", confidence: 0.85, authority: "system_of_record" },
+    ]);
+    const ok = await currentTool.execute("c3", { attribute: "subscription_plan" });
+    expect(ok.details.status).toBe("ok");
+    expect(ok.details.value).toBe("Enterprise");
+    expect(ok.details.authority).toBe("system_of_record");
+    expect(ok.details.confidence).toBeCloseTo(0.85, 5);
+
+    // conflict — both claims surface, and the plugin does not pick either.
+    fake.memoryObjects.state.set(`openclaw_memories_test|${PINNED_USER}|cloud_provider`, [
+      { value: "Azure", confidence: 0.7, authority: "user_statement" },
+      { value: "AWS", confidence: 0.7, authority: "user_statement" },
+    ]);
+    const conflicted = await currentTool.execute("c4", { attribute: "cloud_provider" });
+    expect(conflicted.details.status).toBe("conflict");
+    expect(conflicted.details.competingClaims.map((c: { value: string }) => c.value)).toEqual([
+      "Azure",
+      "AWS",
+    ]);
+    expect(conflicted.content[0].text).toMatch(/Ask the user/);
+  });
+
+  test("memory_trace explains why a value is believed", async () => {
+    const { tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", { text: "seed" });
+    const fake = getLastFake();
+    fake.memoryObjects.episodes[0].attribute = "cloud_provider";
+    fake.memoryObjects.episodes[0].value = "AWS";
+
+    const traced = await tool("memory_trace").execute("c2", { attribute: "cloud_provider" });
+    expect(traced.details.status).toBe("ok");
+    expect(traced.details.derivedFrom[0].content).toBe("seed");
+    expect(traced.details.derivedFrom[0].extraction_method).toBe("explicit_option");
+    expect(traced.content[0].text).toMatch(/is believed because/);
+  });
+
+  test("memory_current / memory_trace degrade with a stable code on a legacy gateway", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: false });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+    // supported stays false.
+
+    const currentTool = registeredTools.find((t) => t.opts?.name === "memory_current")!.tool;
+    const result = await currentTool.execute("c1", { attribute: "subscription_plan" });
+    expect(result.details.error).toBe("MEMORY_FEATURE_UNAVAILABLE");
+    expect(result.content[0].text).toMatch(/v1\.14\.3/);
+  });
+
+  test("memory_forget by query uses FORGET ABOUT and reports the affected counts", async () => {
+    const { fake, tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", { text: "My home address is 42 Elm Street" });
+    await tool("memory_store").execute("c2", { text: "Completely unrelated build tooling note" });
+
+    const result = await tool("memory_forget").execute("c3", { query: "My home address" });
+
+    expect(result.details.action).toBe("forgot_scope");
+    expect(result.details.affected.episodes).toBe(1);
+    // The unrelated memory survived; the address is gone.
+    expect(fake.memoryObjects.episodes.length).toBe(1);
+    expect(fake.memoryObjects.episodes[0].content).toMatch(/build tooling/);
+    // No candidate-listing dance — the engine resolved the scope itself.
+    expect(result.details.candidates).toBeUndefined();
+  });
+
+  test("memory_forget by id issues FORGET MEMORY and reports propagation", async () => {
+    const { fake, tool } = await registerWithMemoryObject();
+    const stored = await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+
+    const result = await tool("memory_forget").execute("c2", { memoryId: stored.details.id });
+    expect(result.details.action).toBe("deleted");
+    expect(result.details.affected.episodes).toBe(1);
+    expect(fake.memoryObjects.episodes.length).toBe(0);
+  });
+
+  test("identity isolation: two host identities never see each other's memories", async () => {
+    const { fake, registeredHooks } = await registerWithMemoryObject({
+      autoCapture: true,
+      autoRecall: true,
+      memory: { identityFrom: "host" },
+    });
+
+    const capture = registeredHooks["agent_end"][0];
+    const recall = registeredHooks["before_prompt_build"][0];
+
+    await capture(
+      {
+        success: true,
+        messages: [{ role: "user", content: "I prefer dark mode for everything" }],
+      },
+      { senderId: "alice" },
+    );
+    await capture(
+      {
+        success: true,
+        messages: [{ role: "user", content: "I prefer bright neon green everywhere" }],
+      },
+      { senderId: "bob" },
+    );
+
+    expect(fake.memoryObjects.episodes.map((e) => e.identity).sort()).toEqual(["alice", "bob"]);
+
+    const forAlice = await recall({ prompt: "I prefer dark mode for everything", messages: [] }, {
+      senderId: "alice",
+    });
+    expect(forAlice.prependContext).toContain("dark mode");
+    expect(forAlice.prependContext).not.toContain("neon green");
+
+    const forBob = await recall({ prompt: "I prefer dark mode for everything", messages: [] }, {
+      senderId: "bob",
+    });
+    expect(forBob?.prependContext ?? "").not.toContain("dark mode");
+  });
+
+  test("identity 'host': a tool call with no context refuses rather than guessing an identity", async () => {
+    const { tool } = await registerWithMemoryObject({ memory: { identityFrom: "host" } });
+
+    // OpenClaw tool execute() handlers carry no session/user context, so there
+    // is nothing to derive an identity from. Falling back to a shared bucket
+    // is the leak this refusal exists to prevent.
+    const result = await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+    expect(result.details.error).toBe("MEMORY_FEATURE_UNAVAILABLE");
+    expect(result.content[0].text).toMatch(/memory\.identity/);
+  });
+
+  test("identity 'host': auto-recall SKIPS when the hook context carries no identity", async () => {
+    const { registeredHooks, fake } = await registerWithMemoryObject({
+      autoRecall: true,
+      memory: { identityFrom: "host" },
+    });
+    const recall = registeredHooks["before_prompt_build"][0];
+
+    const result = await recall({ prompt: "anything at all", messages: [] }, {});
+    expect(result).toBeUndefined();
+    // Nothing was even asked of the gateway — no chance of reading a shared bucket.
+    expect(fake.memoryObjects.calls.filter((c) => /recall/.test(c.path)).length).toBe(0);
+  });
+
+  test("identity 'credential': the plugin names no identity and lets the gateway resolve the pin", async () => {
+    const { fake, tool } = await registerWithMemoryObject(
+      { memory: { identityFrom: "credential" } },
+      (objects) => {
+        objects.identityPin = "user-from-token";
+      },
+    );
+
+    const stored = await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+    expect(stored.details.action).toBe("created");
+    // The request body carried no identity at all.
+    const rememberCall = fake.memoryObjects.calls.find((c) => /remember/.test(c.path))!;
+    expect((rememberCall.body as Record<string, unknown>).identity).toBeUndefined();
+    // …and the gateway filed it under the pinned identity.
+    expect(fake.memoryObjects.episodes[0].identity).toBe("user-from-token");
+  });
+
+  test("identity 'credential' against an UNPINNED credential explains the config fix", async () => {
+    // An API key or an admin token: the gateway deliberately never pins these,
+    // so credential mode cannot work and must say so rather than writing
+    // somewhere unintended.
+    const { fake, tool } = await registerWithMemoryObject({}, (objects) => {
+      objects.identityPin = null;
+    });
+
+    const result = await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+    expect(result.details.error).toBe("MEMORY_CREDENTIAL_UNPINNED");
+    expect(result.content[0].text).toMatch(/carries no memory_identity pin/);
+    // The message must name BOTH fixes, not just the failure.
+    expect(result.content[0].text).toMatch(/ordinary user's token/);
+    expect(result.content[0].text).toMatch(/memory\.identityFrom/);
+    // Nothing was written anywhere — not to the object, not to the legacy
+    // namespace. Falling back to a shared scope is the failure mode this
+    // error exists to prevent.
+    expect(fake.memoryObjects.episodes.length).toBe(0);
+    expect(fake.memory.storeCalls.length).toBe(0);
+  });
+
+  test("an engine that does not mint pins fails credential mode instead of writing to a wrong scope", async () => {
+    // The CREATE MEMORY object exists (so the backend resolves to
+    // memory-object) but this build predates pin minting, so the claim is
+    // simply absent and every unnamed identity comes back as missing_field.
+    const { fake, tool, logs } = await registerWithMemoryObject({}, (objects) => {
+      objects.identityPin = null;
+    });
+
+    const recalled = await tool("memory_recall").execute("c1", { query: "anything at all" });
+    expect(recalled.details.error).toBe("MEMORY_CREDENTIAL_UNPINNED");
+    expect(fake.memoryObjects.episodes.length).toBe(0);
+    // Detection failed, so it never claimed a backend.
+    expect(logs.join("\n")).not.toMatch(/memory backend = /);
+  });
+
+  test("the unpinned verdict is sticky — it does not re-probe the gateway on every call", async () => {
+    const { fake, tool } = await registerWithMemoryObject({}, (objects) => {
+      objects.identityPin = null;
+    });
+
+    await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+    const afterFirst = fake.memoryObjects.calls.length;
+    await tool("memory_store").execute("c2", { text: "I prefer dark mode" });
+    await tool("memory_store").execute("c3", { text: "I prefer dark mode" });
+
+    // An unpinned credential is a configuration fact, not a transient one:
+    // re-probing per operation would just be noise against the gateway.
+    expect(fake.memoryObjects.calls.length).toBe(afterFirst);
+  });
+
+  test("the pin probe is read-only and uses an attribute the engine round-trips unchanged", async () => {
+    const { fake, tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+
+    const probe = fake.memoryObjects.calls.find((c) => /\/current$/.test(c.path));
+    expect(probe).toBeDefined();
+    // CURRENT, not REMEMBER — detection must not write anything.
+    expect((probe!.body as Record<string, unknown>).attribute).toBe("openclaw_pin_probe");
+    expect((probe!.body as Record<string, unknown>).identity).toBeUndefined();
+    // The only episode is the one the test stored.
+    expect(fake.memoryObjects.episodes.length).toBe(1);
+  });
+
+  test("credential mode is the default — no config needed for the gateway to resolve the identity", async () => {
+    const { fake, tool } = await registerWithMemoryObject(); // no `memory` block at all
+
+    const stored = await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+    expect(stored.details.action).toBe("created");
+    const rememberCall = fake.memoryObjects.calls.find((c) => /remember/.test(c.path))!;
+    expect((rememberCall.body as Record<string, unknown>).identity).toBeUndefined();
+    expect(fake.memoryObjects.episodes[0].identity).toBe(PINNED_USER);
+  });
+
+  test("the default (credential) does NOT warn about isolation on a legacy gateway", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools, logs } = buildMockApi({ autoLinkSimilar: false });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+    // supported stays false — a pre-v1.14.3 engine.
+
+    const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")!.tool;
+    await storeTool.execute("c1", { text: "I prefer dark mode for everything" });
+
+    // The operator asked for nothing, so telling them they cannot have
+    // isolation would be a warning everybody sees and nobody reads.
+    expect(logs.join("\n")).toMatch(/memory backend = legacy/);
+    expect(logs.join("\n")).not.toMatch(/asks for per-identity isolation/);
+  });
+
+  test("an EXPLICIT non-static identity source still warns on a legacy gateway", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, logs } = buildMockApi({
+      autoLinkSimilar: false,
+      memory: { identityFrom: "host" },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ext = (memoryPlugin as any).extensions;
+    expect(await ext.backendKind()).toBe("legacy");
+    expect(logs.join("\n")).toMatch(/asks for per-identity isolation/);
+  });
+
+  test("requireIsolation makes the legacy fallback fatal even on the default source", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools } = buildMockApi({
+      autoLinkSimilar: false,
+      memory: { requireIsolation: true },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+
+    const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")!.tool;
+    const result = await storeTool.execute("c1", { text: "I prefer dark mode" });
+    expect(result.details.error).toBe("MEMORY_FEATURE_UNAVAILABLE");
+    expect(result.content[0].text).toMatch(/requireIsolation is on/);
+    // The whole point: it refused rather than writing to the shared namespace.
+    expect(getLastFake().memory.storeCalls.length).toBe(0);
+  });
+
+  test("MEMORY_ACCESS_DENIED is handled explicitly, not as a generic auth failure", async () => {
+    const { tool } = await registerWithMemoryObject(
+      { memory: { identityFrom: "static", identity: "alice" } },
+      (objects) => {
+        // A credential pinned to someone else entirely.
+        objects.identityPin = "bob";
+      },
+    );
+
+    const result = await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+    expect(result.details.error).toBe("MEMORY_ACCESS_DENIED");
+    expect(result.content[0].text).toMatch(/pinned to a different identity/);
+    // The message must name the fix, not just the failure.
+    expect(result.content[0].text).toMatch(/memory\.identityFrom/);
+  });
+
+  test("MEMORY_ACCESS_DENIED in auto-recall is logged as a refusal and injects nothing", async () => {
+    const { registeredHooks, logs } = await registerWithMemoryObject(
+      { autoRecall: true, memory: { identityFrom: "static", identity: "alice" } },
+      (objects) => {
+        objects.identityPin = "bob";
+      },
+    );
+    const recall = registeredHooks["before_prompt_build"][0];
+
+    const result = await recall({ prompt: "what do I prefer?", messages: [] }, {});
+    expect(result).toBeUndefined();
+    expect(logs.join("\n")).toMatch(/auto-recall refused/);
+    expect(logs.join("\n")).toMatch(/MEMORY_ACCESS_DENIED|pinned to a different identity/);
+  });
+
+  test("auto-capture records the turn's role as the claim's source_type", async () => {
+    const { fake, registeredHooks } = await registerWithMemoryObject({ autoCapture: true });
+    const capture = registeredHooks["agent_end"][0];
+
+    await capture(
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "I prefer dark mode for everything" },
+          { role: "assistant", content: "Noted — I always use dark mode for you now" },
+        ],
+      },
+      {},
+    );
+
+    const bySource = Object.fromEntries(
+      fake.memoryObjects.episodes.map((e) => [e.content.slice(0, 8), e.sourceType]),
+    );
+    // A user's own statement outranks the assistant's paraphrase when the two
+    // disagree — that is what source_type is for.
+    expect(bySource["I prefer"]).toBe("user_statement");
+    expect(bySource["Noted — "]).toBe("agent_derivation");
+  });
+
+  test("auto-recall injects the engine's projection verbatim instead of hand-assembling one", async () => {
+    const { registeredHooks, tool } = await registerWithMemoryObject({ autoRecall: true });
+    await tool("memory_store").execute("c1", { text: "I prefer dark mode for everything" });
+
+    const recall = registeredHooks["before_prompt_build"][0];
+    const result = await recall({ prompt: "I prefer dark mode for everything", messages: [] }, {});
+
+    expect(result.prependContext).toContain("<relevant-memories>");
+    expect(result.prependContext).toContain("ENGINE-PROJECTION:");
+    // The legacy hand-assembled "- [category] text" shape is gone on this path.
+    expect(result.prependContext).not.toMatch(/- \[other\]/);
+  });
+
+  test("ltm stats reports which backend is live", async () => {
+    const { ext } = await registerWithMemoryObject();
+    expect(await ext.backendKind()).toBe("memory-object");
+  });
+
+  test("consolidateMemory is an extension, never a model-facing tool", async () => {
+    const { ext, registeredTools, fake, tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", { text: "seed" });
+
+    // Memory correctness must not depend on an agent remembering to call it.
+    expect(registeredTools.map((t) => t.opts?.name)).not.toContain("memory_consolidate");
+
+    const envelope = await ext.consolidateMemory();
+    expect(envelope.status).toBe("completed");
+    expect(fake.memoryObjects.calls.some((c) => /consolidate/.test(c.path))).toBe(true);
+  });
+
+  test("recallFiltered rejects a metadata predicate on the memory-object backend", async () => {
+    const { ext, tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", {
+      text: "I prefer dark mode for everything",
+      category: "preference",
+      importance: 0.9,
+    });
+
+    // The object backend stores no per-memory metadata, so this predicate can
+    // never be true. Returning [] would look like "nothing matched".
+    await expect(
+      ext.recallFiltered({
+        where: "category = 'preference' AND importance >= 0.7",
+        semantic: "what UI does the user like?",
+      }),
+    ).rejects.toThrow(/cannot filter on category, importance/);
+  });
+
+  test("recallFiltered runs the portable predicate subset on the memory-object backend", async () => {
+    const { ext, tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", { text: "I prefer dark mode for everything" });
+    await tool("memory_store").execute("c2", { text: "Postgres was chosen for analytics" });
+
+    const results = await ext.recallFiltered({
+      where: "text LIKE '%dark mode%'",
+      semantic: "what UI does the user like?",
+      limit: 5,
+    });
+    expect(results.length).toBe(1);
+    expect(results[0].entry.text).toContain("dark mode");
+  });
+
+  test("trainRelevanceModel hydrates from the memory object's episodes table", async () => {
+    const { ext, fake, tool } = await registerWithMemoryObject();
+    const ids: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      const stored = await tool("memory_store").execute(`c${i}`, {
+        text: `Test memory number ${i} I prefer thing ${i}`,
+      });
+      ids.push(stored.details.id);
+    }
+
+    const result = await ext.trainRelevanceModel(
+      ids.map((id, i) => ({ memoryId: id, queryText: `Test query ${i}`, score: (i % 11) / 10 })),
+    );
+    expect(result.modelName).toBe("openclaw_memory_relevance");
+    expect(fake.automl.trainCalls.length).toBe(1);
+    // Hydration read the object's own episodes table — the memory verbs have
+    // no fetch-by-id, and the five backing tables are ordinary tables.
+    expect(
+      fake.sqlCalls.some((c) => /_mem_openclaw_memories_test_episodes/.test(c.sql)),
+    ).toBe(true);
+  });
+
+  test("a memory object name that is not a valid engine identifier stays on the legacy path", async () => {
+    // The name becomes part of five physical table names, so the engine holds
+    // it to ^[A-Za-z_][A-Za-z0-9_]*$ and 64 characters. A longer collection is
+    // a reason to stay on the legacy backend, not to refuse to load.
+    const { fake, tool, logs } = await registerWithMemoryObject({
+      memory: { name: "a".repeat(65) },
+    });
+
+    await tool("memory_store").execute("c1", { text: "I prefer dark mode for everything" });
+    expect(fake.memory.storeCalls.length).toBe(1);
+    expect(fake.memoryObjects.episodes.length).toBe(0);
+    expect(logs.join("\n")).toMatch(/not a valid engine identifier/);
   });
 });
 

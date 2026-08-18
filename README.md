@@ -15,6 +15,45 @@ A long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) t
 > long-term memory of personal conversation details; enable it deliberately. See
 > [Privacy & data handling](#privacy--data-handling).
 
+> **0.7.0 shipping note — the `CREATE MEMORY` backend.** SynapCores engine
+> `v1.14.3-ce` introduced a first-class memory object: one logical thing with
+> episodes, durable facts, temporal validity, relationships, provenance and an
+> authoritative current state, driven by five verbs (`REMEMBER`, `RECALL`,
+> `CURRENT`, `FORGET`, `TRACE`). The plugin now **detects it at runtime and uses
+> it when it is there**, and keeps running on the legacy `MEMORY_*` primitives
+> when it is not. Nothing to configure — `memory.backend` defaults to `auto`.
+>
+> What you get on `v1.14.3-ce+`:
+>
+> - **Two new tools.** `memory_current` — the authoritative present value of one
+>   attribute, a deterministic state lookup rather than a similarity search, with
+>   an explicit `conflict` outcome the agent must handle instead of guessing.
+>   `memory_trace` — why a value is believed: the source statement verbatim, when
+>   it was recorded versus when it happened, the extraction method, and what it
+>   superseded.
+> - **Recall that separates authority from similarity.** `memory_recall` and the
+>   auto-recall hook now use the engine's `RECALL`, injecting its
+>   `context.prompt_ready` projection instead of a hand-assembled list — so
+>   current state outranks a semantically similar older episode, and the token
+>   budget truncates the low-priority half rather than the authoritative half.
+> - **Per-identity isolation, with no configuration.** `memory.identityFrom`
+>   defaults to `credential`: the plugin sends no identity and the gateway
+>   resolves it from the token's `memory_identity` pin, so the plugin cannot
+>   address another identity because it never names one. **This needs an
+>   ordinary user token** — API keys and admin tokens are never pinned; with
+>   one of those, set `memory.identityFrom: "static"`. See
+>   [Identity](#identity--who-a-memory-belongs-to).
+> - **The engine owns dedup.** The old client-side "is this a near-duplicate?"
+>   probe before every store is gone on this backend; consolidation, supersession
+>   and conflict policy are the database's job.
+> - **`confidence` and `relevance` stay separate.** Relevance is the retrieval
+>   score; confidence is evidence strength. `MemorySearchResult.score` remains
+>   relevance, and `confidence` is its own optional field.
+>
+> Trade-offs and the full mapping (including what the legacy path can do that
+> the new one cannot — `importance` / `category` are **not persisted** on the
+> memory object) are in [MIGRATION.md](./MIGRATION.md).
+
 > **0.5.0 shipping note:** the core memory ops (`memory_store` / `memory_recall` / `memory_forget`) ride the engine-side `MEMORY_STORE` / `MEMORY_RECALL` / `MEMORY_FORGET` primitives via `@synapcores/sdk@^0.6.0`'s `client.memory` surface. The plugin's public API (tools, CLI, extensions, types) is unchanged.
 >
 > - **Requires SynapCores gateway `v1.8.5-ce` or newer** (the version that ships the `MEMORY_*` SQL functions).
@@ -178,12 +217,66 @@ This plugin is **privacy-safe by default and passive out of the box.**
 | `synapcores.host` | no | `localhost` | SynapCores gateway hostname. |
 | `synapcores.port` | no | `8080` | SynapCores gateway port. |
 | `synapcores.useHttps` | no | `false` | Use TLS to talk to the gateway. |
-| `collection` | no | `openclaw_memories` | SynapCores collection name. |
+| `collection` | no | `openclaw_memories` | SynapCores collection name. Also the default name of the `CREATE MEMORY` object. |
 | `graph` | no | `openclaw_memory_graph` | SynapCores graph name (used for `SIMILAR_TO` edges and `recallRelated` walks). |
+| `memory.backend` | no | `auto` | `auto` \| `memory-object` \| `legacy`. `auto` probes once and picks; `memory-object` fails loudly on an engine older than v1.14.3-ce; `legacy` never probes. |
+| `memory.name` | no | = `collection` | Name of the `CREATE MEMORY` object. Must match `^[A-Za-z_][A-Za-z0-9_]*$`, ≤64 chars — it becomes part of five table names. |
+| `memory.identityField` | no | `user_id` | `IDENTITY <field>` used when the plugin creates the object. Ignored afterwards. |
+| `memory.identityFrom` | no | `credential` | `credential` \| `static` \| `host` — see [Identity](#identity--who-a-memory-belongs-to). |
+| `memory.identity` | no | — (`default` in `static` mode) | Identity value for `static` mode; tool-call fallback for `host` mode. Ignored in `credential` mode. |
+| `memory.autoCreate` | no | `true` | Create the memory object on first use when the gateway supports it. |
+| `memory.requireIsolation` | no | `false` | Fail instead of falling back to the legacy backend when per-identity isolation was asked for. |
+| `memory.tokenBudget` | no | `512` | `token_budget` for prompt-injection `RECALL`. |
+| `memory.sourceType` | no | `user_statement` | Claim authority for `memory_store` writes. |
 | `autoCapture` | no | `true` | Auto-store memorable utterances after each agent turn. |
 | `autoRecall` | no | `true` | Auto-inject relevant memories before each agent turn. |
 | `autoLinkSimilar` | no | `true` | On capture, insert each Memory as a graph node carrying the embedding so `recallRelated` returns useful neighborhoods out of the box. Adds ~30-50ms per capture; disable if you never call `recallRelated`. |
 | `workspace` | no | — | Optional workspace suffix on the AutoML relevance model name so multiple installations sharing one gateway can train independent models. |
+
+## Identity — who a memory belongs to
+
+The legacy backend keyed everything on one flat namespace shared by the whole
+install. The `CREATE MEMORY` object splits that into an object plus a per-call
+**identity**, and the engine guarantees reads and writes never cross identities.
+
+The plugin never *guesses* an identity, because guessing wrong means one user
+reading another user's memory. OpenClaw tool handlers receive no session or
+user context (the host's `execute()` signature has none) — which is exactly why
+the default lets the **gateway** supply what the host cannot:
+
+| `memory.identityFrom` | Behaviour | Use it when |
+| --- | --- | --- |
+| `credential` (default) | The plugin sends **no** identity; the gateway resolves it from the token's `memory_identity` claim. The plugin cannot address another identity because it never names one. | Your credential is an ordinary user token. Needs no configuration. |
+| `static` | Every call uses `memory.identity` (default `"default"`). One identity for the whole install — the same isolation the legacy shared namespace gave. | Your credential is an **API key** or an admin token (the gateway never pins those), and one host serves one person. |
+| `host` | Derived per turn from the OpenClaw hook context (`senderId` → `accountId` → `sessionKey` → `sessionId`). Tool calls, which have no context, use `memory.identity` if set and otherwise **refuse**. | A multi-user host — a Discord/Slack bot serving many people through one backend credential. |
+
+**Which credentials the gateway pins.** Ordinary interactive logins get
+`memory_identity` set to the user's own id. **Admin tokens and API keys stay
+unpinned on purpose**: an admin must be able to administer (and `FORGET` on
+behalf of) other identities, and one service key legitimately serves many end
+users, supplying the identity per request.
+
+> **If you followed the README's setup and created a FullAccess API key**, that
+> key is unpinned, so the default `credential` mode will refuse with
+> `MEMORY_CREDENTIAL_UNPINNED` and tell you so at startup. Set
+> `memory.identityFrom: "static"` (or `"host"` for a multi-user bot) — one line
+> — or configure an ordinary user's token instead. The plugin refuses rather
+> than quietly writing everything into a shared scope you did not choose.
+
+A credential pinned to one identity that names a different one is refused with
+HTTP 403 `MEMORY_ACCESS_DENIED`. The plugin surfaces that as its own error with
+the fix in the message — it is never retried against another identity and never
+reported as "the gateway is unreachable".
+
+Identity is defence in depth, not the only boundary: each registered CE user
+gets its own tenant, and memory objects are tenant-keyed, so two registered
+users cannot reach each other's memory regardless of this setting.
+
+**On a pre-v1.14.3 engine there is no identity dimension at all**: the legacy
+namespace is shared and this whole section is moot — the plugin stays on the
+legacy backend and never probes for a pin. If you *explicitly* asked for `host`
+or `credential` on such a gateway it logs a prominent warning; set
+`memory.requireIsolation: true` to make it a hard failure instead.
 
 ## What you get
 
@@ -208,9 +301,15 @@ Once registered, the plugin:
 
 | Tool | What it does |
 | --- | --- |
-| `memory_recall` | Vector-search the memory store. Params: `{ query: string, limit?: number }` (default 5). |
-| `memory_store` | Persist a new memory. Params: `{ text, importance?, category? }`. De-dupes against >0.95 cosine similarity. |
-| `memory_forget` | Delete a memory by `memoryId` (engine-assigned id, e.g. `mem_…`) or by `query` (auto-deletes if exactly one candidate at >0.9 similarity, otherwise returns candidates). |
+| `memory_recall` | Retrieve relevant memory. Params: `{ query: string, limit?: number }` (default 5). On the memory-object backend this is `RECALL`: the reply text is the engine's `context.prompt_ready` projection, and `details` keeps `currentState` separate from the ranked list. On legacy it is a vector search. |
+| `memory_store` | Persist a memory. Params: `{ text, importance?, category? }`. Legacy de-dupes client-side against >0.95 cosine similarity; the memory-object backend does not, because the engine owns dedup. **`importance` and `category` are not persisted on the memory-object backend** (see MIGRATION.md §6). |
+| `memory_forget` | Delete by `memoryId`, or by `query`. On the memory-object backend a query issues `FORGET … ABOUT` and returns the per-category counts the engine removed; on legacy it auto-deletes a single >0.9 match and otherwise returns candidates. |
+| `memory_current` | **v1.14.3-ce+.** The authoritative current value of one attribute. Params: `{ attribute: string }`. Deterministic, never a similarity search. Returns the value with its authority and `valid_from`, or `not_found`, or `conflict` with both competing claims — which the engine deliberately does not resolve. |
+| `memory_trace` | **v1.14.3-ce+.** Why a value is believed. Params: `{ attribute: string }`. Returns the source statement verbatim, recorded-vs-event time, extraction method, confidence and what it superseded. |
+
+`memory_current` and `memory_trace` are registered unless `memory.backend` is
+`legacy`; on an older engine they answer with a stable
+`MEMORY_FEATURE_UNAVAILABLE` result rather than failing.
 
 ### Extensions (programmatic, SynapCores-only)
 
@@ -242,8 +341,29 @@ interface MemorySynapCoresExtensions {
     queryText: string;
     score: number;          // 0..1
   }>): Promise<{ modelId: string; modelName: string }>;
+
+  /** Which backend this gateway resolved to. Runs detection on first call. */
+  backendKind(): Promise<"legacy" | "memory-object">;
+
+  /**
+   * Force a consolidation cycle NOW (memory-object backend only).
+   *
+   * Optional control, never a prerequisite — the engine schedules its own
+   * consolidation and current state is already correct the moment a write
+   * returns. Deliberately NOT a model-facing tool: memory correctness must not
+   * depend on an agent remembering to call it. Reach for it in a test, before
+   * a report, or after a bulk import.
+   */
+  consolidateMemory(): Promise<MemoryEnvelope>;
 }
 ```
+
+On the memory-object backend, `recallFiltered` supports only the predicate
+fields that backend actually has — `text` / `content`, `id`, `score` /
+`similarity`, `confidence`. A predicate naming `category`, `importance`,
+`createdAt` or `metadata->>'…'` **throws** rather than returning an empty
+result set, because the memory object stores no per-memory metadata. Set
+`memory.backend: "legacy"` to keep the metadata-filtering surface.
 
 #### `recallFiltered` — SQL-scoped semantic recall
 

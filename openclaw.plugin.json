@@ -17,7 +17,9 @@
     "tools": [
       "memory_store",
       "memory_recall",
-      "memory_forget"
+      "memory_forget",
+      "memory_current",
+      "memory_trace"
     ]
   },
   "configSchema": {
@@ -67,6 +69,69 @@
         "type": "string",
         "title": "Memory Graph",
         "description": "SynapCores graph name used for memory relations (SIMILAR_TO edges + recallRelated walks)."
+      },
+      "memory": {
+        "type": "object",
+        "title": "Persistent Memory Object",
+        "additionalProperties": false,
+        "description": "Controls for the CREATE MEMORY backend (SRS v1.2). Requires SynapCores engine v1.14.3-ce or newer; on older engines the plugin auto-detects and keeps using the legacy MEMORY_* namespace, so this whole block can be left unset. One exception: identityFrom 'credential' (the default) also needs an engine build that mints the memory_identity pin on login — with an API key, an admin token, or an engine that does not mint pins, set identityFrom to 'static' or 'host'.",
+        "properties": {
+          "backend": {
+            "type": "string",
+            "enum": ["auto", "memory-object", "legacy"],
+            "default": "auto",
+            "title": "Memory Backend",
+            "description": "auto (default) probes the gateway once and uses the v1.14.3+ CREATE MEMORY object when available, falling back to the legacy MEMORY_* namespace. 'memory-object' fails loudly if the engine is too old; 'legacy' never probes."
+          },
+          "name": {
+            "type": "string",
+            "title": "Memory Object Name",
+            "description": "Name of the CREATE MEMORY object. Defaults to the collection name. Must match ^[A-Za-z_][A-Za-z0-9_]*$ and be at most 64 characters, because it becomes part of the five backing table names."
+          },
+          "identityField": {
+            "type": "string",
+            "default": "user_id",
+            "title": "Memory Identity Field",
+            "description": "IDENTITY field used when the plugin creates the memory object. Ignored once the object exists — the gateway reads the field from the object itself."
+          },
+          "identityFrom": {
+            "type": "string",
+            "enum": ["credential", "static", "host"],
+            "default": "credential",
+            "title": "Memory Identity Source",
+            "description": "credential (default) = send no identity and let the gateway resolve the token's memory_identity pin; the plugin cannot address another identity because it never names one. Needs an ordinary user token — API keys and admin tokens are never pinned, and using one fails with MEMORY_CREDENTIAL_UNPINNED. static = one identity for this whole install (the same isolation the legacy namespace gave). host = derive per turn from the OpenClaw sender/session, for multi-user hosts."
+          },
+          "identity": {
+            "type": "string",
+            "title": "Memory Identity",
+            "description": "Identity value used when identityFrom is 'static' (defaults to 'default'), and the tool-call fallback when identityFrom is 'host'. Ignored in credential mode."
+          },
+          "autoCreate": {
+            "type": "boolean",
+            "default": true,
+            "title": "Auto-Create Memory Object",
+            "description": "Create the memory object on first use when the gateway supports it but the object does not exist yet."
+          },
+          "requireIsolation": {
+            "type": "boolean",
+            "default": false,
+            "title": "Require Identity Isolation",
+            "description": "Fail rather than fall back to the legacy backend when per-identity isolation was requested. The legacy MEMORY_* namespace has no identity dimension — every identity shares it."
+          },
+          "tokenBudget": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 512,
+            "title": "Recall Token Budget",
+            "description": "token_budget passed to RECALL when injecting memory context into a prompt. When it is exceeded, lower-priority context is truncated and authoritative current state is preserved."
+          },
+          "sourceType": {
+            "type": "string",
+            "default": "user_statement",
+            "title": "Memory Source Type",
+            "description": "Claim authority recorded for memories written via memory_store. Conflict resolution considers it first: system_of_record > verified_user_statement > user_statement > tool_result > agent_derivation > agent_inference."
+          }
+        }
       },
       "autoCapture": {
         "type": "boolean",
