@@ -79,7 +79,7 @@
       "npmSpec": "@synapcores/openclaw-memory",
       "defaultChoice": "npm",
       "minHostVersion": ">=2026.7.1",
-      "_minSynapCoresEngineVersionNote": "Unchanged at v1.8.5-ce: v0.7.0 stays backward compatible with the legacy MEMORY_* backend and auto-detects. Two features need newer engines. (1) The CREATE MEMORY backend -- memory_current / memory_trace, per-identity scoping, prompt_ready recall -- needs v1.14.3-ce. (2) memory.identityFrom='credential' (the default) additionally needs an engine build that MINTS the memory_identity pin on login; earlier v1.14.3 builds enforce the claim but never populate it, so credential mode fails there with MEMORY_CREDENTIAL_UNPINNED and the fix is memory.identityFrom='static' or 'host'. Legacy, 'static' and 'host' modes need nothing beyond v1.8.5-ce.",
+      "_minSynapCoresEngineVersionNote": "Unchanged at v1.8.5-ce: v0.7.0 stays backward compatible with the legacy MEMORY_* backend and auto-detects. Two features need newer engines. (1) The CREATE MEMORY backend -- memory_current / memory_trace, per-identity scoping, prompt_ready recall -- needs v1.14.3-ce. (2) memory.identityFrom='credential' (the default) needs an engine that MINTS the memory_identity pin on login; v1.14.3-ce DOES mint it (verified against the published artifact: a freshly registered user's token carries memory_identity == sub), so credential mode works on v1.14.3-ce and later. Against an engine that enforces the claim without populating it, credential mode fails loudly with MEMORY_CREDENTIAL_UNPINNED and the fix is memory.identityFrom='static' or 'host'. Legacy, 'static' and 'host' modes need nothing beyond v1.8.5-ce.",
       "minSynapCoresEngineVersion": "v1.8.5-ce"
     },
     "build": {
