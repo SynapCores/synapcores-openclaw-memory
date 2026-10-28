@@ -223,7 +223,12 @@ class FakeMemoryObjects {
   /** Simulates a credential whose token carries a `memory_identity` claim. */
   public identityPin: string | null = null;
   public createFails = false;
-  public objects = new Map<string, { identity_field: string }>();
+  public objects = new Map<
+    string,
+    { identity_field: string; options?: Record<string, unknown>; agent?: string }
+  >();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  public lastCreate: any = null;
   public episodes: FakeEpisode[] = [];
   /** `${memory}|${identity}|${attribute}` -> claims. Two claims = a conflict. */
   public state = new Map<string, Array<{ value: string; confidence: number; authority: string }>>();
@@ -309,10 +314,17 @@ class FakeMemoryObjects {
     if (this.objects.has(name)) {
       throw fakeSdkError("bad_request", "MEMORY_ALREADY_EXISTS", "already exists");
     }
-    this.objects.set(name, { identity_field: String(body?.identity_field ?? "user_id") });
+    this.lastCreate = body;
+    this.objects.set(name, {
+      identity_field: String(body?.identity_field ?? "user_id"),
+      options: (body?.options ?? {}) as Record<string, unknown>,
+      agent: typeof body?.agent === "string" ? body.agent : undefined,
+    });
     return this.envelope("CREATE MEMORY", name, "", "completed", {
       memory: name,
       identity_field: body?.identity_field,
+      options: body?.options ?? {},
+      agent: body?.agent ?? null,
     });
   }
 
@@ -518,6 +530,98 @@ class FakeMemoryObjects {
     return this.envelope("CONSOLIDATE", name, identity, "completed", {
       episodes_processed: this.episodes.filter((e) => e.identity === identity).length,
     });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  history(name: string, body: any) {
+    this.requireObject(name);
+    const identity = this.resolveIdentity(body?.identity);
+    const attribute = typeof body?.attribute === "string" ? body.attribute : undefined;
+    const rows = this.episodes
+      .filter((e) => e.identity === identity && (!attribute || e.attribute === attribute))
+      .map((e) => ({
+        attribute: e.attribute ?? null,
+        value: e.value ?? e.content,
+        recorded_at: e.recordedAt.toISOString(),
+        authority: e.sourceType,
+      }));
+    return this.envelope("HISTORY", name, identity, rows.length > 0 ? "ok" : "not_found", {
+      history: rows,
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  search(name: string, body: any) {
+    this.requireObject(name);
+    const identity = this.resolveIdentity(body?.identity);
+    const q = String(body?.query ?? "");
+    const hits = this.episodes
+      .filter((e) => e.identity === identity && e.content.toLowerCase().includes(q.toLowerCase()))
+      .map((e) => ({ id: e.id, content: e.content, relevance: 0.9 }));
+    return this.envelope("SEARCH", name, identity, "ok", { results: hits });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supersede(name: string, body: any) {
+    this.requireObject(name);
+    const identity = this.resolveIdentity(body?.identity);
+    const attribute = String(body?.attribute ?? "");
+    const value = String(body?.value ?? "");
+    this.state.set(`${name}|${identity}|${attribute}`, [
+      { value, confidence: 1, authority: "system_of_record" },
+    ]);
+    return this.envelope("SUPERSEDE", name, identity, "completed", { attribute, value });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  reconcile(name: string, body: any) {
+    this.requireObject(name);
+    const identity = this.resolveIdentity(body?.identity);
+    return this.envelope("RECONCILE", name, identity, "completed", { reconciled: true });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  explain(name: string, body: any) {
+    this.requireObject(name);
+    const identity = this.resolveIdentity(body?.identity);
+    return this.envelope("EXPLAIN", name, identity, "ok", {
+      about: String(body?.about ?? ""),
+      plan: "episodes∪facts ranked by cosine then authority",
+    });
+  }
+
+  describe(name: string) {
+    this.requireObject(name);
+    const def = this.objects.get(name);
+    return this.envelope("DESCRIBE MEMORY", name, "", "ok", {
+      memory_name: name,
+      identity_field: def?.identity_field,
+      agent: def?.agent ?? null,
+      options: def?.options ?? {},
+    });
+  }
+
+  status(name: string) {
+    this.requireObject(name);
+    return this.envelope("DESCRIBE MEMORY", name, "", "ok", {
+      memory_name: name,
+      episodes: this.episodes.length,
+      options: this.objects.get(name)?.options ?? {},
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  alter(name: string, body: any) {
+    this.requireObject(name);
+    const def = this.objects.get(name)!;
+    def.options = { ...(def.options ?? {}), ...(body?.options ?? {}) };
+    return this.envelope("ALTER MEMORY", name, "", "completed", { options: def.options });
+  }
+
+  drop(name: string) {
+    this.requireObject(name);
+    this.objects.delete(name);
+    return this.envelope("DROP MEMORY", name, "", "completed", { dropped: name });
   }
 }
 
@@ -839,6 +943,9 @@ class FakeSynapCores {
     get: (path: string) => Promise<{ data: unknown }>;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     post: (path: string, body?: any) => Promise<{ data: unknown }>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    put: (path: string, body?: any) => Promise<{ data: unknown }>;
+    delete: (path: string) => Promise<{ data: unknown }>;
   } {
     const self = this;
     return {
@@ -849,6 +956,16 @@ class FakeSynapCores {
         if (path === "/memory") {
           self.memoryObjects.calls.push({ path, body: undefined });
           return { data: self.memoryObjects.list() };
+        }
+        const status = path.match(/^\/memory\/([^/]+)\/status$/);
+        if (status) {
+          self.memoryObjects.calls.push({ path, body: undefined });
+          return { data: self.memoryObjects.status(status[1]) };
+        }
+        const describe = path.match(/^\/memory\/([^/]+)$/);
+        if (describe) {
+          self.memoryObjects.calls.push({ path, body: undefined });
+          return { data: self.memoryObjects.describe(describe[1]) };
         }
         throw new Error(`FakeSynapCores._getHttpClient: unhandled GET ${path}`);
       },
@@ -875,6 +992,16 @@ class FakeSynapCores {
                 return { data: self.memoryObjects.forget(name, body) };
               case "consolidate":
                 return { data: self.memoryObjects.consolidate(name, body) };
+              case "history":
+                return { data: self.memoryObjects.history(name, body) };
+              case "search":
+                return { data: self.memoryObjects.search(name, body) };
+              case "supersede":
+                return { data: self.memoryObjects.supersede(name, body) };
+              case "reconcile":
+                return { data: self.memoryObjects.reconcile(name, body) };
+              case "explain":
+                return { data: self.memoryObjects.explain(name, body) };
               default:
                 throw new Error(`FakeSynapCores: unhandled memory verb ${verb}`);
             }
@@ -897,6 +1024,24 @@ class FakeSynapCores {
           return { data: { columns: result.columns, rows: result.rows, count: result.rows.length } };
         }
         throw new Error(`FakeSynapCores._getHttpClient: unhandled POST ${path}`);
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async put(path: string, body?: any) {
+        const m = path.match(/^\/memory\/([^/]+)$/);
+        if (m) {
+          self.memoryObjects.calls.push({ path, body });
+          return { data: self.memoryObjects.alter(m[1], body) };
+        }
+        throw new Error(`FakeSynapCores._getHttpClient: unhandled PUT ${path}`);
+      },
+      async delete(path: string) {
+        // The plugin appends a query string (?cascade=true&if_exists=true).
+        const m = path.match(/^\/memory\/([^/?]+)/);
+        if (m) {
+          self.memoryObjects.calls.push({ path, body: undefined });
+          return { data: self.memoryObjects.drop(m[1]) };
+        }
+        throw new Error(`FakeSynapCores._getHttpClient: unhandled DELETE ${path}`);
       },
     };
   }
@@ -1394,17 +1539,18 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     memoryPlugin.register(mockApi as any);
 
-    // Five tools since 0.7.0: the three legacy ones plus memory_current /
-    // memory_trace, which the CREATE MEMORY backend makes possible. They are
-    // registered up front because capability detection is async and
-    // registration is not; on a legacy gateway they answer with a stable
-    // MEMORY_FEATURE_UNAVAILABLE result.
-    expect(registeredTools.length).toBe(5);
+    // Six tools since 0.8.0: the three legacy ones plus memory_current /
+    // memory_trace / memory_history, which the CREATE MEMORY backend makes
+    // possible. They are registered up front because capability detection is
+    // async and registration is not; on a legacy gateway they answer with a
+    // stable MEMORY_FEATURE_UNAVAILABLE result.
+    expect(registeredTools.length).toBe(6);
     expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_recall");
     expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_store");
     expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_forget");
     expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_current");
     expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_trace");
+    expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_history");
     expect(registeredClis.length).toBe(1);
     expect(registeredServices.length).toBe(1);
 
@@ -1573,7 +1719,7 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     expect(() => memoryPlugin.register(mockApi as any)).not.toThrow();
     // The rest of registration (tools, etc.) must still complete normally —
     // this is the whole point of the guard.
-    expect(registeredTools.length).toBe(5);
+    expect(registeredTools.length).toBe(6);
   });
 
   test("recallFiltered runs the WHERE clause engine-side against MEMORY_RECALL output (legacy shorthand auto-rewrites)", async () => {
@@ -2045,6 +2191,67 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
     expect(fake.memoryObjects.objects.get("openclaw_memories_test")?.identity_field).toBe(
       "tenant_user",
     );
+  });
+
+  test("autoCreate sends CREATE MEMORY WITH() options + FOR AGENT (0.8.0)", async () => {
+    const { fake, tool } = await registerWithMemoryObject({
+      memory: {
+        create: {
+          forAgent: "support_agent",
+          embeddingModel: "nomic-embed-text",
+          dimensions: 768,
+          llmExtraction: false,
+          episodic: true,
+          consolidateAfterEpisodes: 50,
+        },
+      },
+    });
+
+    // The first operation triggers detection, which CREATEs the object.
+    await tool("memory_store").execute("c1", { text: "I prefer dark mode" });
+
+    const create = fake.memoryObjects.lastCreate;
+    expect(create).toBeTruthy();
+    expect(create.agent).toBe("support_agent");
+    // camelCase config keys arrive as the engine's snake_case WITH keys.
+    expect(create.options).toMatchObject({
+      embedding_model: "nomic-embed-text",
+      dimensions: 768,
+      llm_extraction: false,
+      episodic: true,
+      consolidate_after_episodes: 50,
+    });
+  });
+
+  test("autoCreate with no create block still sends only name + identity (unchanged default)", async () => {
+    const { fake, tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", { text: "hello" });
+    const create = fake.memoryObjects.lastCreate;
+    expect(create.agent ?? undefined).toBeUndefined();
+    // No WITH options -> the key is omitted, so the engine keeps its defaults.
+    expect(create.options ?? undefined).toBeUndefined();
+  });
+
+  test("memory_history tool returns the timeline on the memory-object backend (0.8.0)", async () => {
+    const { tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("c1", { text: "The user upgraded to the pro plan" });
+
+    const res = await tool("memory_history").execute("c2", {});
+    expect(res.details.status).toBe("ok");
+    expect(Array.isArray(res.details.history)).toBe(true);
+    expect(res.details.history.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("memory_history is unavailable on the legacy backend (stable error, no throw)", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi, registeredTools } = buildMockApi({ autoLinkSimilar: false });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(mockApi as any);
+    // supported stays false -> legacy backend.
+    const historyTool = registeredTools.find((t) => t.opts?.name === "memory_history")!.tool;
+    const res = await historyTool.execute("c1", { attribute: "subscription_plan" });
+    // asToolError returns a result, it does not throw.
+    expect(JSON.stringify(res)).toMatch(/MEMORY_FEATURE_UNAVAILABLE|requires the CREATE MEMORY backend/i);
   });
 
   test("capability detection: backend 'memory-object' fails loudly instead of falling back", async () => {

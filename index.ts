@@ -37,6 +37,7 @@ import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
   type MemoryObjectConfig,
+  type MemoryCreateRequest,
   memoryConfigSchema,
 } from "./config.js";
 
@@ -1013,6 +1014,8 @@ const CREDENTIAL_PIN_PROBE_ATTRIBUTE = "openclaw_pin_probe";
 type HttpLike = {
   get: (path: string) => Promise<{ data: unknown }>;
   post: (path: string, body?: unknown) => Promise<{ data: unknown }>;
+  put: (path: string, body?: unknown) => Promise<{ data: unknown }>;
+  delete: (path: string) => Promise<{ data: unknown }>;
 };
 
 /**
@@ -1252,13 +1255,147 @@ class MemoryObjectDB {
     return Array.isArray(body) ? (body as Array<Record<string, unknown>>) : [];
   }
 
-  /** `CREATE MEMORY <name> IDENTITY <field>` — every other option left at the engine's defaults. */
-  async createMemory(identityField: string): Promise<MemoryEnvelope> {
-    const response = await this.http().post("/memory", {
+  /**
+   * `CREATE MEMORY <name> [FOR AGENT <a>] IDENTITY <field> [WITH (...)]`.
+   *
+   * `create.agent` maps to `FOR AGENT`; `create.options` is the `WITH (...)`
+   * map (already engine-keyed). When `create` is omitted or empty the object is
+   * created on the engine's own defaults, exactly as before 0.8.0.
+   */
+  async createMemory(
+    identityField: string,
+    create?: MemoryCreateRequest,
+  ): Promise<MemoryEnvelope> {
+    const body: Record<string, unknown> = {
       name: this.memoryName,
       identity_field: identityField,
-    });
+    };
+    if (create?.agent) {
+      body.agent = create.agent;
+    }
+    if (create?.options && Object.keys(create.options).length > 0) {
+      body.options = create.options;
+    }
+    const response = await this.http().post("/memory", body);
     return (response?.data ?? {}) as MemoryEnvelope;
+  }
+
+  /** `DESCRIBE MEMORY <name>` — the object's definition + option values. */
+  async describe(): Promise<MemoryEnvelope> {
+    try {
+      const response = await this.http().get(`/memory/${this.memoryName}`);
+      return (response?.data ?? {}) as MemoryEnvelope;
+    } catch (err) {
+      throw translateMemoryError(err, "DESCRIBE", undefined);
+    }
+  }
+
+  /**
+   * `GET /:name/status` — operational health/stats for the object.
+   *
+   * This replaces the pre-0.8.0 habit of faking stats with a raw `COUNT(*)` on
+   * the internal `_mem_<name>_episodes` table, which returned the whole
+   * tenant-visible count (wrong) under a credential-pinned identity.
+   */
+  async status(): Promise<MemoryEnvelope> {
+    try {
+      const response = await this.http().get(`/memory/${this.memoryName}/status`);
+      return (response?.data ?? {}) as MemoryEnvelope;
+    } catch (err) {
+      throw translateMemoryError(err, "STATUS", undefined);
+    }
+  }
+
+  /** `HISTORY` — the temporal timeline of how an attribute's value changed. */
+  async history(
+    identity: string | undefined,
+    attribute: string | undefined,
+    limit?: number,
+  ): Promise<MemoryEnvelope> {
+    const options: Record<string, unknown> = {};
+    if (typeof limit === "number" && Number.isFinite(limit)) {
+      options.limit = limit;
+    }
+    const body: Record<string, unknown> = { ...this.scope(identity), options };
+    if (attribute) {
+      body.attribute = attribute;
+    }
+    return this.call(`/memory/${this.memoryName}/history`, body, "HISTORY", identity);
+  }
+
+  /** `SEARCH` — raw semantic search over the object (vs RECALL's distilled view). */
+  async search(
+    identity: string | undefined,
+    query: string,
+    options: Record<string, unknown> = {},
+  ): Promise<MemoryEnvelope> {
+    return this.call(
+      `/memory/${this.memoryName}/search`,
+      { ...this.scope(identity), query, options },
+      "SEARCH",
+      identity,
+    );
+  }
+
+  /** `SUPERSEDE` — explicitly set an attribute's current value, superseding prior claims. */
+  async supersede(
+    identity: string | undefined,
+    attribute: string,
+    value: string,
+    options: Record<string, unknown> = {},
+  ): Promise<MemoryEnvelope> {
+    return this.call(
+      `/memory/${this.memoryName}/supersede`,
+      { ...this.scope(identity), attribute, value, options },
+      "SUPERSEDE",
+      identity,
+    );
+  }
+
+  /** `RECONCILE` — re-run conflict resolution across (optionally one) attribute. */
+  async reconcile(
+    identity: string | undefined,
+    attribute?: string,
+  ): Promise<MemoryEnvelope> {
+    const body: Record<string, unknown> = { ...this.scope(identity), options: {} };
+    if (attribute) {
+      body.attribute = attribute;
+    }
+    return this.call(`/memory/${this.memoryName}/reconcile`, body, "RECONCILE", identity);
+  }
+
+  /** `EXPLAIN MEMORY <name> ABOUT <q>` — how the engine would answer a recall. */
+  async explain(identity: string | undefined, about: string): Promise<MemoryEnvelope> {
+    return this.call(
+      `/memory/${this.memoryName}/explain`,
+      { ...this.scope(identity), about },
+      "EXPLAIN",
+      identity,
+    );
+  }
+
+  /** `ALTER MEMORY <name> SET (...)` — change option values in place. */
+  async alter(options: Record<string, unknown>): Promise<MemoryEnvelope> {
+    try {
+      const response = await this.http().put(`/memory/${this.memoryName}`, { options });
+      return (response?.data ?? {}) as MemoryEnvelope;
+    } catch (err) {
+      throw translateMemoryError(err, "ALTER", undefined);
+    }
+  }
+
+  /** `DROP MEMORY [IF EXISTS] <name>` — remove the object (optionally its stored memories). */
+  async drop(options: { cascade?: boolean; ifExists?: boolean } = {}): Promise<MemoryEnvelope> {
+    const query: string[] = [];
+    if (options.cascade) query.push("cascade=true");
+    if (options.ifExists) query.push("if_exists=true");
+    const suffix = query.length > 0 ? `?${query.join("&")}` : "";
+    try {
+      const response = await this.http().delete(`/memory/${this.memoryName}${suffix}`);
+      return (response?.data ?? {}) as MemoryEnvelope;
+    } catch (err) {
+      throw translateMemoryError(err, "DROP", undefined);
+    }
   }
 
   async remember(
@@ -1615,9 +1752,13 @@ class MemoryRouter {
         return this.settle("legacy", why);
       }
       try {
-        await this.objectDb.createMemory(this.cfg.identityField);
+        await this.objectDb.createMemory(this.cfg.identityField, this.cfg.create);
+        const withNote =
+          Object.keys(this.cfg.create.options).length > 0 || this.cfg.create.agent
+            ? ` (${this.cfg.create.agent ? `FOR AGENT ${this.cfg.create.agent}, ` : ""}WITH ${JSON.stringify(this.cfg.create.options)})`
+            : "";
         this.logger.info?.(
-          `memory-synapcores: created memory object '${this.objectDb.name}' IDENTITY ${this.cfg.identityField}`,
+          `memory-synapcores: created memory object '${this.objectDb.name}' IDENTITY ${this.cfg.identityField}${withNote}`,
         );
       } catch (err) {
         // Another OpenClaw instance won the race — that is success, not failure.
@@ -1871,6 +2012,72 @@ class MemoryRouter {
   async consolidate(identity: string | undefined): Promise<MemoryEnvelope> {
     await this.requireObjectBackend("consolidateMemory (CONSOLIDATE)");
     return this.objectDb.consolidate(identity);
+  }
+
+  /** `HISTORY` — temporal timeline for an attribute. Throws on the legacy backend. */
+  async history(
+    attribute: string | undefined,
+    identity: string | undefined,
+    limit?: number,
+  ): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("memory_history (HISTORY)");
+    return this.objectDb.history(identity, attribute, limit);
+  }
+
+  /** `SEARCH` — raw semantic search. Throws on the legacy backend. */
+  async search(
+    query: string,
+    identity: string | undefined,
+    options: Record<string, unknown> = {},
+  ): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("SEARCH");
+    return this.objectDb.search(identity, query, options);
+  }
+
+  /** `SUPERSEDE` — set an attribute's current value. Throws on the legacy backend. */
+  async supersede(
+    attribute: string,
+    value: string,
+    identity: string | undefined,
+    options: Record<string, unknown> = {},
+  ): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("SUPERSEDE");
+    return this.objectDb.supersede(identity, attribute, value, options);
+  }
+
+  /** `RECONCILE` — re-resolve conflicts. Throws on the legacy backend. */
+  async reconcile(attribute: string | undefined, identity: string | undefined): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("RECONCILE");
+    return this.objectDb.reconcile(identity, attribute);
+  }
+
+  /** `EXPLAIN` — dry-run a recall. Throws on the legacy backend. */
+  async explain(about: string, identity: string | undefined): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("EXPLAIN");
+    return this.objectDb.explain(identity, about);
+  }
+
+  /** `DESCRIBE MEMORY` / `GET /:name/status` — definition + stats. Throws on legacy. */
+  async describe(): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("DESCRIBE");
+    return this.objectDb.describe();
+  }
+
+  async status(): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("status");
+    return this.objectDb.status();
+  }
+
+  /** `ALTER MEMORY ... SET (...)`. Throws on the legacy backend. */
+  async alter(options: Record<string, unknown>): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("ALTER MEMORY");
+    return this.objectDb.alter(options);
+  }
+
+  /** `DROP MEMORY`. Throws on the legacy backend. */
+  async drop(options: { cascade?: boolean; ifExists?: boolean } = {}): Promise<MemoryEnvelope> {
+    await this.requireObjectBackend("DROP MEMORY");
+    return this.objectDb.drop(options);
   }
 
   private async requireObjectBackend(operation: string): Promise<void> {
@@ -3381,6 +3588,90 @@ const memoryPlugin = {
         },
         { name: "memory_trace" },
       );
+
+      api.registerTool(
+        {
+          name: "memory_history",
+          label: "Memory History",
+          description:
+            "Show the TIMELINE of how a remembered attribute's value changed over time — the " +
+            "ordered list of what it was, when each value held, and what superseded what. Use " +
+            "this when the user asks what they used to think/prefer/decide, or when you need to " +
+            "reason about a change ('you switched from X to Y last month'), rather than just the " +
+            "current value (memory_current) or related context (memory_recall). Omit the " +
+            "attribute to get the most recent changes across all attributes.",
+          parameters: Type.Object({
+            attribute: Type.Optional(
+              Type.String({
+                description:
+                  "Attribute whose history to show, e.g. subscription_plan. Omit for a cross-attribute recent timeline.",
+              }),
+            ),
+            limit: Type.Optional(
+              Type.Integer({ minimum: 1, description: "Max timeline entries to return." }),
+            ),
+          }),
+          async execute(_toolCallId, params) {
+            const { attribute, limit } = params as { attribute?: string; limit?: number };
+            try {
+              const identity = identities.forTool("memory_history");
+              const envelope = await router.history(attribute, identity, limit);
+              const data = (envelope.data ?? {}) as Record<string, unknown>;
+              const entries = Array.isArray(data.history)
+                ? data.history
+                : Array.isArray(data.entries)
+                  ? data.entries
+                  : [];
+
+              if (envelope.status === "not_found" || entries.length === 0) {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: attribute
+                        ? `No history recorded for '${attribute}'.`
+                        : "No history recorded yet.",
+                    },
+                  ],
+                  details: { status: envelope.status ?? "not_found", attribute: attribute ?? null },
+                };
+              }
+
+              const rendered = entries
+                .map((e) => {
+                  const row = (e ?? {}) as Record<string, unknown>;
+                  const attr = row.attribute ? `${String(row.attribute)} = ` : "";
+                  return (
+                    `- ${attr}${String(row.value ?? "")} ` +
+                    `(${String(row.valid_from ?? row.recorded_at ?? "?")}` +
+                    `${row.valid_to ? ` → ${String(row.valid_to)}` : ""}` +
+                    `${row.authority ? `, ${String(row.authority)}` : ""})`
+                  );
+                })
+                .join("\n");
+
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      (attribute ? `History of '${attribute}':` : "Recent memory history:") +
+                      `\n${rendered}`,
+                  },
+                ],
+                details: {
+                  status: envelope.status ?? "ok",
+                  attribute: attribute ?? null,
+                  history: entries,
+                },
+              };
+            } catch (err) {
+              return asToolError(err);
+            }
+          },
+        },
+        { name: "memory_history" },
+      );
     }
 
     // ========================================================================
@@ -3427,15 +3718,90 @@ const memoryPlugin = {
           .description("Show memory statistics")
           .action(async () => {
             const backend = await router.kind();
-            const count = await router.count(identities.forTool("ltm stats"));
             console.log(`Backend: ${backend}`);
             if (backend === "memory-object") {
               console.log(`Memory object: ${router.memoryName}`);
               console.log(`Identity source: ${identities.source}`);
+              // Prefer the engine's own status/describe over a client-side
+              // COUNT, which is wrong under a credential-pinned identity.
+              try {
+                const envelope = await router.status();
+                console.log(JSON.stringify(envelope.data ?? {}, null, 2));
+                return;
+              } catch (err) {
+                console.log(`(status unavailable: ${(err as { message?: string })?.message ?? err})`);
+              }
             } else {
               console.log(`Namespace: ${namespace}`);
             }
+            const count = await router.count(identities.forTool("ltm stats"));
             console.log(`Total memories: ${count}`);
+          });
+
+        memory
+          .command("describe")
+          .description("Describe the memory object's definition and options (memory-object backend)")
+          .action(async () => {
+            const envelope = await router.describe();
+            console.log(JSON.stringify(envelope.data ?? {}, null, 2));
+          });
+
+        memory
+          .command("history")
+          .description("Show how an attribute's value changed over time (memory-object backend)")
+          .argument("[attribute]", "Attribute to show history for; omit for a recent cross-attribute timeline")
+          .option("--limit <n>", "Max timeline entries")
+          .action(async (attribute, opts) => {
+            const limit = opts.limit ? parseInt(opts.limit, 10) : undefined;
+            const envelope = await router.history(
+              attribute,
+              identities.forTool("ltm history"),
+              limit,
+            );
+            console.log(JSON.stringify(envelope.data ?? {}, null, 2));
+          });
+
+        memory
+          .command("consolidate")
+          .description("Run memory consolidation now (memory-object backend)")
+          .action(async () => {
+            const envelope = await router.consolidate(identities.forTool("ltm consolidate"));
+            console.log(JSON.stringify(envelope.data ?? {}, null, 2));
+          });
+
+        memory
+          .command("supersede")
+          .description("Explicitly set an attribute's current value (memory-object backend)")
+          .argument("<attribute>", "Attribute name")
+          .argument("<value>", "New current value")
+          .action(async (attribute, value) => {
+            const envelope = await router.supersede(
+              attribute,
+              value,
+              identities.forTool("ltm supersede"),
+            );
+            console.log(JSON.stringify(envelope.data ?? {}, null, 2));
+          });
+
+        memory
+          .command("reconcile")
+          .description("Re-run conflict resolution, optionally for one attribute (memory-object backend)")
+          .argument("[attribute]", "Attribute to reconcile; omit for all")
+          .action(async (attribute) => {
+            const envelope = await router.reconcile(
+              attribute,
+              identities.forTool("ltm reconcile"),
+            );
+            console.log(JSON.stringify(envelope.data ?? {}, null, 2));
+          });
+
+        memory
+          .command("drop")
+          .description("Drop the memory object (memory-object backend)")
+          .option("--cascade", "Also drop all stored memories")
+          .action(async (opts) => {
+            const envelope = await router.drop({ cascade: opts.cascade === true, ifExists: true });
+            console.log(JSON.stringify(envelope.data ?? { dropped: router.memoryName }, null, 2));
           });
       },
       { commands: ["ltm"] },

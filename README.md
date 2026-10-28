@@ -15,6 +15,27 @@ A long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) t
 > long-term memory of personal conversation details; enable it deliberately. See
 > [Privacy & data handling](#privacy--data-handling).
 
+> **0.8.0 shipping note — the full memory-object surface.** The `CREATE MEMORY`
+> backend introduced in 0.7.0 is now reachable end to end:
+>
+> - **`CREATE MEMORY ... WITH (...)` is now configurable.** Before 0.8.0 the
+>   plugin created every memory object on the engine's blind defaults — including
+>   the embedding model and width. Set `memory.create.embeddingModel` /
+>   `memory.create.dimensions` to match your deployment's `EMBED` model (a
+>   mismatch silently breaks semantic recall), toggle `memory.create.llmExtraction`,
+>   `FOR AGENT`, and the episodic/semantic/temporal/consolidation knobs. Applied
+>   only when the plugin auto-creates the object; an unset block keeps the old
+>   default behaviour exactly.
+> - **New `memory_history` tool** — the timeline of how a remembered attribute's
+>   value changed over time ("what did I used to prefer?"), distinct from the
+>   current value (`memory_current`) and related context (`memory_recall`).
+> - **Honest `ltm stats`** — now reads the engine's own `status`/`DESCRIBE`
+>   instead of a client-side `COUNT(*)` that returned the wrong number under a
+>   credential-pinned identity.
+> - **New `ltm` subcommands:** `describe`, `history`, `consolidate`, `supersede`,
+>   `reconcile`, `drop` — the memory-object lifecycle and reasoning verbs, all
+>   gated to the memory-object backend.
+
 > **0.7.0 shipping note — the `CREATE MEMORY` backend.** SynapCores engine
 > `v1.14.3-ce` introduced a first-class memory object: one logical thing with
 > episodes, durable facts, temporal validity, relationships, provenance and an
@@ -228,6 +249,7 @@ This plugin is **privacy-safe by default and passive out of the box.**
 | `memory.requireIsolation` | no | `false` | Fail instead of falling back to the legacy backend when per-identity isolation was asked for. |
 | `memory.tokenBudget` | no | `512` | `token_budget` for prompt-injection `RECALL`. |
 | `memory.sourceType` | no | `user_statement` | Claim authority for `memory_store` writes. |
+| `memory.create` | no | `{}` | `CREATE MEMORY ... WITH (...)` tuning applied only when the plugin creates the object. All optional; anything unset stays on the engine default. Keys: `forAgent` (→ `FOR AGENT`), `embeddingModel`, `dimensions`, `llmExtraction`, `episodic`, `semantic`, `temporal`, `relationships`, `provenance`, `consolidation`, `consolidateOnSessionEnd`, `consolidateAfterEpisodes`, `retainRawEpisodes`, `singularAttributes`. **Pin `embeddingModel`+`dimensions` to your gateway's EMBED model — a mismatch silently breaks semantic recall.** |
 | `autoCapture` | no | `true` | Auto-store memorable utterances after each agent turn. |
 | `autoRecall` | no | `true` | Auto-inject relevant memories before each agent turn. |
 | `autoLinkSimilar` | no | `true` | On capture, insert each Memory as a graph node carrying the embedding so `recallRelated` returns useful neighborhoods out of the box. Adds ~30-50ms per capture; disable if you never call `recallRelated`. |
@@ -282,8 +304,8 @@ or `credential` on such a gateway it logs a prominent warning; set
 
 Once registered, the plugin:
 
-1. Exposes three OpenClaw **tools** to your agents: `memory_recall`, `memory_store`, `memory_forget`.
-2. Adds a CLI sub-command `openclaw ltm {list,search,stats}`.
+1. Exposes OpenClaw **tools** to your agents: `memory_recall`, `memory_store`, `memory_forget`, plus (on the memory-object backend) `memory_current`, `memory_trace`, `memory_history`.
+2. Adds a CLI sub-command `openclaw ltm {list,search,stats,describe,history,consolidate,supersede,reconcile,drop}` (the last six require the memory-object backend).
 3. Hooks `before_prompt_build` to auto-recall relevant memories (if `autoRecall: true`).
 4. Hooks `agent_end` to auto-capture preferences / decisions / entities / facts matching a rule-based
    trigger list (if `autoCapture: true`) — a fast, per-turn safety net, not exhaustive by design.
@@ -306,9 +328,10 @@ Once registered, the plugin:
 | `memory_forget` | Delete by `memoryId`, or by `query`. On the memory-object backend a query issues `FORGET … ABOUT` and returns the per-category counts the engine removed; on legacy it auto-deletes a single >0.9 match and otherwise returns candidates. |
 | `memory_current` | **v1.14.3-ce+.** The authoritative current value of one attribute. Params: `{ attribute: string }`. Deterministic, never a similarity search. Returns the value with its authority and `valid_from`, or `not_found`, or `conflict` with both competing claims — which the engine deliberately does not resolve. |
 | `memory_trace` | **v1.14.3-ce+.** Why a value is believed. Params: `{ attribute: string }`. Returns the source statement verbatim, recorded-vs-event time, extraction method, confidence and what it superseded. |
+| `memory_history` | **v1.14.3-ce+ (plugin 0.8.0).** The timeline of how an attribute's value changed over time. Params: `{ attribute?: string, limit?: number }` — omit `attribute` for a recent cross-attribute timeline. Use it for "what did I used to think" rather than the current value or related context. |
 
-`memory_current` and `memory_trace` are registered unless `memory.backend` is
-`legacy`; on an older engine they answer with a stable
+`memory_current`, `memory_trace` and `memory_history` are registered unless
+`memory.backend` is `legacy`; on an older engine they answer with a stable
 `MEMORY_FEATURE_UNAVAILABLE` result rather than failing.
 
 ### Extensions (programmatic, SynapCores-only)

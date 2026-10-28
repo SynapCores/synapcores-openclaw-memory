@@ -48,6 +48,27 @@ export type MemoryObjectConfig = {
   tokenBudget: number;
   /** `source_type` (claim authority) for memories written through the memory_store tool. */
   sourceType: string;
+  /**
+   * `CREATE MEMORY ... [FOR AGENT a] IDENTITY f WITH (...)` tuning, applied
+   * ONLY when the plugin creates the object (autoCreate). Pre-built from the
+   * operator's `memory.create` block into the engine's request shape so the
+   * REST layer passes it straight to `POST /v1/memory`: `agent` becomes
+   * `FOR AGENT`, and `options` is the `WITH (...)` map. Both empty by default,
+   * so an unconfigured install still creates the object on the engine's own
+   * defaults — but an operator can now pin `embedding_model` / `dimensions` to
+   * match the deployment's embedding space, toggle `llm_extraction`, and tune
+   * the episodic/semantic/temporal/consolidation knobs, instead of every
+   * memory object silently inheriting whatever the engine happened to default.
+   */
+  create: MemoryCreateRequest;
+};
+
+/** The engine-shaped CREATE MEMORY request the plugin sends when autoCreating. */
+export type MemoryCreateRequest = {
+  /** `FOR AGENT <agent>` — a top-level field on `POST /v1/memory`, not a WITH key. */
+  agent?: string;
+  /** The `WITH (...)` map, already in the engine's snake_case key form. */
+  options: Record<string, unknown>;
 };
 
 export type MemoryConfig = {
@@ -132,6 +153,87 @@ function parseEnum<T extends string>(
 }
 
 /**
+ * Parse the `memory.create` block — the `CREATE MEMORY ... WITH (...)` tuning
+ * the plugin applies when it autoCreates the object.
+ *
+ * Camel-cased operator keys map to the engine's snake_case `WITH` keys; only
+ * keys the operator actually set are emitted, so anything left out stays on the
+ * engine's own default. `forAgent` is lifted out to the top-level `agent` field
+ * (it becomes `FOR AGENT`, not a `WITH` pair). Unknown keys and wrong types
+ * fail here with a clear message rather than surfacing as an engine option
+ * error on first use.
+ */
+function parseCreateBlock(value: unknown): MemoryCreateRequest {
+  if (value === undefined) {
+    return { options: {} };
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("memory.create must be an object");
+  }
+  const raw = value as Record<string, unknown>;
+  // key -> [engine key, kind]. `forAgent` is special-cased below.
+  const BOOL_KEYS: Record<string, string> = {
+    llmExtraction: "llm_extraction",
+    episodic: "episodic",
+    semantic: "semantic",
+    temporal: "temporal",
+    relationships: "relationships",
+    provenance: "provenance",
+    consolidateOnSessionEnd: "consolidate_on_session_end",
+    retainRawEpisodes: "retain_raw_episodes",
+  };
+  const INT_KEYS: Record<string, string> = {
+    dimensions: "dimensions",
+    consolidateAfterEpisodes: "consolidate_after_episodes",
+  };
+  const STR_KEYS: Record<string, string> = {
+    embeddingModel: "embedding_model",
+    consolidation: "consolidation",
+    singularAttributes: "singular_attributes",
+  };
+  assertAllowedKeys(
+    raw,
+    ["forAgent", ...Object.keys(BOOL_KEYS), ...Object.keys(INT_KEYS), ...Object.keys(STR_KEYS)],
+    "memory.create config",
+  );
+
+  const options: Record<string, unknown> = {};
+  for (const [key, engineKey] of Object.entries(BOOL_KEYS)) {
+    if (raw[key] === undefined) continue;
+    if (typeof raw[key] !== "boolean") {
+      throw new Error(`memory.create.${key} must be a boolean`);
+    }
+    options[engineKey] = raw[key];
+  }
+  for (const [key, engineKey] of Object.entries(INT_KEYS)) {
+    if (raw[key] === undefined) continue;
+    const n = raw[key];
+    if (typeof n !== "number" || !Number.isInteger(n) || n <= 0) {
+      throw new Error(`memory.create.${key} must be a positive integer`);
+    }
+    options[engineKey] = n;
+  }
+  for (const [key, engineKey] of Object.entries(STR_KEYS)) {
+    if (raw[key] === undefined) continue;
+    if (typeof raw[key] !== "string" || (raw[key] as string).trim().length === 0) {
+      throw new Error(`memory.create.${key} must be a non-empty string`);
+    }
+    options[engineKey] = (raw[key] as string).trim();
+  }
+
+  const agent =
+    typeof raw.forAgent === "string" && raw.forAgent.trim().length > 0
+      ? raw.forAgent.trim()
+      : raw.forAgent === undefined
+        ? undefined
+        : (() => {
+            throw new Error("memory.create.forAgent must be a non-empty string");
+          })();
+
+  return agent === undefined ? { options } : { agent, options };
+}
+
+/**
  * Parse the `memory` block — the CREATE MEMORY (SRS v1.2) backend controls.
  *
  * Every field has a default that reproduces the pre-0.7.0 behaviour as closely
@@ -156,6 +258,7 @@ function parseMemoryBlock(value: unknown): MemoryObjectConfig {
       "requireIsolation",
       "tokenBudget",
       "sourceType",
+      "create",
     ],
     "memory config",
   );
@@ -204,6 +307,7 @@ function parseMemoryBlock(value: unknown): MemoryObjectConfig {
       typeof mem.sourceType === "string" && mem.sourceType.length > 0
         ? mem.sourceType
         : DEFAULT_SOURCE_TYPE,
+    create: parseCreateBlock(mem.create),
   };
 }
 
@@ -366,6 +470,21 @@ export const memoryConfigSchema = {
       label: "Memory Source Type",
       advanced: true,
       help: "Claim authority recorded for memories written via memory_store (default user_statement). Higher authority wins conflicts: system_of_record > verified_user_statement > user_statement > tool_result > agent_derivation > agent_inference.",
+    },
+    "memory.create.embeddingModel": {
+      label: "Memory Embedding Model",
+      advanced: true,
+      help: "CREATE MEMORY WITH (embedding_model = ...). Pin the memory object's embedding model so it matches the deployment's EMBED model (default: the gateway's configured embedding model). Applied only when the plugin creates the object.",
+    },
+    "memory.create.dimensions": {
+      label: "Memory Embedding Dimensions",
+      advanced: true,
+      help: "CREATE MEMORY WITH (dimensions = ...). Vector width, which must match the embedding model (e.g. 384 for all-minilm, 768 for nomic-embed-text). Set together with the embedding model.",
+    },
+    "memory.create.llmExtraction": {
+      label: "Memory LLM Extraction",
+      advanced: true,
+      help: "CREATE MEMORY WITH (llm_extraction = true|false). Whether the engine uses an LLM to extract semantic facts from episodes. Turn off for rules-only extraction on a no-model deployment.",
     },
     autoCapture: {
       label: "Auto-Capture",

@@ -19,7 +19,8 @@
       "memory_recall",
       "memory_forget",
       "memory_current",
-      "memory_trace"
+      "memory_trace",
+      "memory_history"
     ]
   },
   "configSchema": {

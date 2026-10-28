@@ -1,6 +1,6 @@
 {
   "name": "@synapcores/openclaw-memory",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "OpenClaw long-term memory plugin backed by your own self-hosted SynapCores AIDB gateway. Passive by default (explicit memory_store/recall/forget tools); an OPT-IN lifecycle, off by default, can proactively capture conversation-derived personal facts at the end of each agent turn and before context compaction. Data stays in your gateway \u2014 no third-party egress.",
   "type": "module",
   "main": "./dist/index.js",
