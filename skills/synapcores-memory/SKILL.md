@@ -41,26 +41,33 @@ no external API key and no third-party service in the path.
 
 ## Setup
 
-**1. Run a SynapCores gateway** (once):
+**1. Run a SynapCores gateway** (once). Bind it to loopback so your personal
+memory database stays local to this machine, and pin the image to a specific
+release rather than a mutable tag:
 
 ```bash
-docker run -d --name synapcores -p 8080:8080 \
+docker run -d --name synapcores -p 127.0.0.1:8080:8080 \
   -v synapcores-data:/var/lib/synapcores \
   -e SYNAPCORES_TELEMETRY=off \
-  ghcr.io/synapcores/community:latest
+  ghcr.io/synapcores/community:v2.5.0-ce
 ```
 
-The first boot prints an admin login and an API key:
+On first boot the gateway prints **your own** admin login and a starter API key
+to its startup console. If you launched it detached, read that startup output
+yourself:
 
 ```bash
-docker logs synapcores 2>&1 | grep -A2 'ADMIN LOGIN'
+docker logs synapcores
 ```
+
+Copy the `aidb_…` API key it shows. It is your credential on your own machine —
+the plugin only ever sends it to your local gateway, never anywhere else.
 
 **2. Export the key:**
 
 ```bash
 export SYNAPCORES_API_KEY="aidb_…"
-export SYNAPCORES_URL="http://localhost:8080"
+export SYNAPCORES_URL="http://127.0.0.1:8080"
 ```
 
 **3. Check it answers:**
