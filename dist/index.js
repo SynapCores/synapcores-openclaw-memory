@@ -1907,16 +1907,21 @@ const DEFAULT_RECALL_RELATED_LIMIT = 20;
  * Non-fatal, and a no-op when no node exists or the graph is unavailable.
  */
 async function removeGraphCopy(client, id, logger) {
+    // Returns true when the graph copy was removed (or there was nothing to
+    // remove), false when cleanup FAILED — callers surface that instead of
+    // reporting a clean forget while a copy may survive.
     if (!/^[A-Za-z0-9_-]+$/.test(id))
-        return;
+        return true;
     try {
         const http = client._getHttpClient();
         await http.post("/graph/match", {
             sql: `MATCH (m:Memory {id: '${id}'}) DETACH DELETE m`,
         });
+        return true;
     }
     catch (err) {
-        logger?.warn?.(`memory-synapcores: graph-copy cleanup skipped for ${id}: ${String(err)} (row delete already succeeded)`);
+        logger?.warn?.(`memory-synapcores: graph-copy cleanup FAILED for ${id}: ${String(err)} (row delete already succeeded; a graph copy may remain)`);
+        return false;
     }
 }
 async function linkSimilarMemories(entry, client, embedVector, logger) {
@@ -2616,12 +2621,22 @@ const memoryPlugin = {
                     }
                     // Explicitly remove any graph copy of this memory on every backend,
                     // so a forgotten memory is not still reachable via graph relations.
-                    await removeGraphCopy(client, memoryId, api.logger);
+                    const graphRemoved = await removeGraphCopy(client, memoryId, api.logger);
                     return {
-                        content: [{ type: "text", text: `Memory ${memoryId} forgotten.` }],
+                        content: [
+                            {
+                                type: "text",
+                                text: graphRemoved
+                                    ? `Memory ${memoryId} forgotten.`
+                                    : `Memory ${memoryId} was deleted, but its graph copy could not be removed and may still be recallable — retry forget once the gateway graph service is reachable.`,
+                            },
+                        ],
                         details: {
                             action: "deleted",
                             id: memoryId,
+                            // Report graph-copy cleanup honestly rather than claiming a
+                            // clean forget when the DETACH DELETE failed.
+                            graphCleanup: graphRemoved ? "removed" : "failed",
                             // FORGET propagates to derived facts, embeddings,
                             // relationships, current-state values and provenance, and
                             // reports the count per category. Legacy deletes one row.
@@ -2655,21 +2670,32 @@ const memoryPlugin = {
                     if (scoped.supported) {
                         // Explicitly remove the graph copies of the forgotten memories so
                         // a scope-based forget leaves nothing recallable in the graph.
+                        let graphFailures = 0;
                         for (const cid of candidateIds) {
-                            await removeGraphCopy(client, cid, api.logger);
+                            if (!(await removeGraphCopy(client, cid, api.logger)))
+                                graphFailures++;
                         }
                         const affected = (scoped.affected ?? {});
                         const total = Object.values(affected).reduce((sum, v) => sum + (typeof v === "number" ? v : 0), 0);
+                        const graphNote = graphFailures > 0
+                            ? ` Note: ${graphFailures} graph copy/copies could not be removed and may remain recallable — retry forget once the graph service is reachable.`
+                            : "";
                         return {
                             content: [
                                 {
                                     type: "text",
                                     text: total > 0
-                                        ? `Forgot everything about "${query}" (${total} record(s) across episodes, facts, state, relationships and provenance).`
+                                        ? `Forgot everything about "${query}" (${total} record(s) across episodes, facts, state, relationships and provenance).${graphNote}`
                                         : `Nothing matching "${query}" was stored.`,
                                 },
                             ],
-                            details: { action: "forgot_scope", scope: query, affected, status: scoped.status },
+                            details: {
+                                action: "forgot_scope",
+                                scope: query,
+                                affected,
+                                status: scoped.status,
+                                graphCleanup: graphFailures > 0 ? `failed:${graphFailures}` : "removed",
+                            },
                         };
                     }
                     const results = await db.searchByQuery(query, 5, 0.7);
