@@ -9,8 +9,10 @@ A long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) t
 > `autoRecall`, both **off by default**). When you turn `autoCapture` on, the
 > plugin becomes proactive: at the **end of every agent turn** and again **just
 > before OpenClaw compacts the context**, it inspects the conversation, infers
-> durable personal facts, preferences, and decisions, and **persists them (in
-> the model's own words) to your SynapCores gateway** — and `autoRecall` injects
+> durable personal facts, preferences, and decisions, and **persists the
+> matching statements — short, trigger-filtered snippets, with anything that
+> looks like a secret or regulated identifier skipped — to your SynapCores
+> gateway** — and `autoRecall` injects
 > matching memories back into the model's context on later turns. This is real
 > long-term memory of personal conversation details; enable it deliberately. See
 > [Privacy & data handling](#privacy--data-handling).
@@ -208,8 +210,9 @@ This plugin is **privacy-safe by default and passive out of the box.**
 - **What "opt-in automatic capture" actually does.** When you set
   `autoCapture: true`, the plugin subscribes to the `agent_end` conversation
   hook and, **at the end of every agent turn**, inspects that turn and stores the
-  durable personal facts, preferences, and decisions it infers — paraphrased in
-  the model's own words, not raw transcripts — to your gateway. Separately, the
+  durable personal facts, preferences, and decisions it recognises — as short,
+  trigger-filtered statements bounded to 500 characters, with anything matching
+  a secret or regulated-identifier pattern skipped — to your gateway. Separately, the
   **pre-compaction flush** fires **just before OpenClaw discards older context**
   and prompts the agent to persist anything still worth keeping. Both require the
   host permission `plugins.entries.memory-synapcores.hooks.allowConversationAccess: true`.

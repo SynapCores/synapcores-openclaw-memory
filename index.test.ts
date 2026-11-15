@@ -1398,6 +1398,11 @@ describe("capture filter heuristics", () => {
       { text: "I live in Miami and I'm a vegetarian.", shouldMatch: true },
       { text: "We've decided to use Postgres instead of MySQL going forward.", shouldMatch: true },
       { text: "I can't eat gluten.", shouldMatch: true },
+      // Secrets/regulated identifiers must NOT be auto-captured even when the
+      // surrounding sentence matches a memory trigger.
+      { text: "Remember that my API key is aidb_wxyz12345678", shouldMatch: false },
+      { text: "Remember my password = SuperSecretValue99", shouldMatch: false },
+      { text: "My SSN is 123-45-6789", shouldMatch: false },
       { text: "Just a random short message", shouldMatch: false },
       { text: "x", shouldMatch: false },
       { text: "<relevant-memories>injected</relevant-memories>", shouldMatch: false },

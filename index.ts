@@ -460,25 +460,9 @@ class MemoryDB {
       throw new Error(`Invalid memory ID: ${String(id)}`);
     }
     const deleted = await this.client.memory.forget(this.namespace, id);
-    // Best-effort: also remove the `Memory` graph node that
-    // `linkSimilarMemories` may have created (when autoLinkSimilar is on), so a
-    // forgotten memory leaves no recallable copy behind in the graph. Legacy
-    // `memory.forget` only deletes the `_memory_<ns>` row. Non-fatal, and a
-    // no-op when no node exists or the graph is unavailable.
-    if (/^[A-Za-z0-9_-]+$/.test(id)) {
-      try {
-        const http = (
-          this.client as unknown as {
-            _getHttpClient: () => { post: (p: string, b: unknown) => Promise<unknown> };
-          }
-        )._getHttpClient();
-        await http.post("/graph/match", {
-          sql: `MATCH (m:Memory {id: '${id}'}) DETACH DELETE m`,
-        });
-      } catch {
-        // graph unavailable or no node — the row delete above is what counts
-      }
-    }
+    // Legacy `memory.forget` only deletes the `_memory_<ns>` row; also drop any
+    // `Memory` graph copy so the memory is not still reachable via relations.
+    await removeGraphCopy(this.client, id);
     return deleted;
   }
 
@@ -2284,6 +2268,17 @@ function extractMessageTurns(messages: unknown[]): MessageTurn[] {
   return turns;
 }
 
+// Patterns that must never be auto-captured, even on a trigger match: API
+// keys/tokens, passwords, private keys, card numbers, and government IDs. A
+// raw conversation turn can carry these incidentally, and they do not belong
+// in long-term memory.
+const SENSITIVE_CAPTURE_PATTERNS: RegExp[] = [
+  /\b(?:sk-[A-Za-z0-9]{16,}|aidb_[A-Za-z0-9]{8,}|ak_[A-Za-z0-9]{8,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  /\b(?:password|passwd|api[_-]?key|secret|token|bearer)\b\s*[:=]\s*\S+/i,
+  /\b\d{3}-\d{2}-\d{4}\b/,
+];
+
 export function shouldCapture(text: string): boolean {
   if (text.length < 10 || text.length > 500) {
     return false;
@@ -2303,6 +2298,12 @@ export function shouldCapture(text: string): boolean {
   // Skip emoji-heavy responses (likely agent output)
   const emojiCount = (text.match(/[\u{1F300}-\u{1F9FF}]/gu) || []).length;
   if (emojiCount > 3) {
+    return false;
+  }
+  // Never auto-capture secrets or regulated identifiers, even on a trigger
+  // match — this is exactly the "unrelated sensitive content" a raw turn can
+  // carry.
+  if (SENSITIVE_CAPTURE_PATTERNS.some((r) => r.test(text))) {
     return false;
   }
   return MEMORY_TRIGGERS.some((r) => r.test(text));
@@ -2427,6 +2428,35 @@ const DEFAULT_RECALL_RELATED_LIMIT = 20;
  * memory subsystem; we just log and move on so the rest of recall keeps
  * working.
  */
+/**
+ * Best-effort removal of the `Memory` graph node that `linkSimilarMemories`
+ * may have created for a memory, so a forgotten memory leaves no recallable
+ * copy behind in the graph. Runs for every backend — the legacy row delete and
+ * the memory-object FORGET both leave these plugin-created nodes untouched.
+ * Non-fatal, and a no-op when no node exists or the graph is unavailable.
+ */
+async function removeGraphCopy(
+  client: SynapCores,
+  id: string,
+  logger?: { warn?: (msg: string) => void } | undefined,
+): Promise<void> {
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) return;
+  try {
+    const http = (
+      client as unknown as {
+        _getHttpClient: () => { post: (p: string, b: unknown) => Promise<unknown> };
+      }
+    )._getHttpClient();
+    await http.post("/graph/match", {
+      sql: `MATCH (m:Memory {id: '${id}'}) DETACH DELETE m`,
+    });
+  } catch (err) {
+    logger?.warn?.(
+      `memory-synapcores: graph-copy cleanup skipped for ${id}: ${String(err)} (row delete already succeeded)`,
+    );
+  }
+}
+
 async function linkSimilarMemories(
   entry: MemoryEntry,
   client: SynapCores,
@@ -3365,6 +3395,9 @@ const memoryPlugin = {
             } catch (err) {
               return asToolError(err);
             }
+            // Explicitly remove any graph copy of this memory on every backend,
+            // so a forgotten memory is not still reachable via graph relations.
+            await removeGraphCopy(client, memoryId, api.logger);
             return {
               content: [{ type: "text", text: `Memory ${memoryId} forgotten.` }],
               details: {
