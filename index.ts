@@ -3131,6 +3131,25 @@ const memoryPlugin = {
       `memory-synapcores: plugin registered (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, namespace: ${namespace}, memory: ${memoryObjectName}, backend: ${cfg.memory.backend}, identity: ${cfg.memory.identityFrom}, autoLinkSimilar: ${autoLinkSimilar}, lazy init)`,
     );
 
+    // Transport-security guard: a non-loopback gateway reached over plaintext
+    // HTTP exposes memory traffic (the API key and recalled personal facts) to
+    // anyone on the network path. Loopback is exempt. We warn rather than
+    // hard-fail so an operator on a trusted private link is not blocked.
+    const transportHost = (cfg.synapcores.host ?? "").trim().toLowerCase();
+    const isLoopbackHost =
+      transportHost === "localhost" ||
+      transportHost === "127.0.0.1" ||
+      transportHost === "::1" ||
+      transportHost === "[::1]" ||
+      transportHost.endsWith(".localhost");
+    if (!cfg.synapcores.useHttps && transportHost && !isLoopbackHost) {
+      api.logger.warn(
+        `memory-synapcores: connecting to remote gateway '${transportHost}' over plaintext ` +
+          `HTTP — memory traffic and the API key are unencrypted on the network path. Set ` +
+          `synapcores.useHttps: true for any non-loopback host.`,
+      );
+    }
+
     /**
      * Render a thrown memory error as a tool result.
      *
@@ -3416,6 +3435,16 @@ const memoryPlugin = {
             // resolves the scope semantically, propagates the removal, and
             // returns a receipt. The legacy path has no such verb, which is
             // why the search-then-confirm dance below still exists for it.
+            // Collect the matching memory ids BEFORE forgetting, so we can also
+            // drop their `Memory` graph copies — scope forget removes rows and
+            // derived state in the engine but not plugin-created graph nodes.
+            let candidateIds: string[] = [];
+            try {
+              const pre = await router.recallForPrompt(query, identity, 25);
+              candidateIds = pre.results.map((r) => r.entry.id).filter(Boolean);
+            } catch {
+              // best-effort: cleanup proceeds without pre-collected ids
+            }
             let scoped;
             try {
               scoped = await router.forgetAbout(query, identity);
@@ -3423,6 +3452,11 @@ const memoryPlugin = {
               return asToolError(err);
             }
             if (scoped.supported) {
+              // Explicitly remove the graph copies of the forgotten memories so
+              // a scope-based forget leaves nothing recallable in the graph.
+              for (const cid of candidateIds) {
+                await removeGraphCopy(client, cid, api.logger);
+              }
               const affected = (scoped.affected ?? {}) as Record<string, unknown>;
               const total = Object.values(affected).reduce<number>(
                 (sum, v) => sum + (typeof v === "number" ? v : 0),
