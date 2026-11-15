@@ -42,40 +42,30 @@ no external API key and no third-party service in the path.
 ## Setup
 
 **1. Run a SynapCores gateway** (once). Bind it to loopback so your personal
-memory database stays local to this machine, and pin the image to a specific
-release rather than a mutable tag:
+memory database stays local to this machine, and pin the image **by digest** so
+the published tag can never be swapped under you:
 
 ```bash
 docker run -d --name synapcores -p 127.0.0.1:8080:8080 \
   -v synapcores-data:/var/lib/synapcores \
   -e SYNAPCORES_TELEMETRY=off \
-  ghcr.io/synapcores/community:v2.5.0-ce
+  ghcr.io/synapcores/community:v2.5.1-ce@sha256:c2a583fef157b3d6afab1844641d95185d4893ac5a8f1268aa56f7af40707f1a
 ```
 
 On first boot the gateway prints **your own** admin login and a starter API key
-to its startup console. If you launched it detached, read that startup output
-yourself:
+to its own startup console. Read that startup output on your machine and copy
+the `aidb_…` API key it shows. It is your credential on your own machine — the
+plugin only ever sends it to your local gateway, never anywhere else.
 
-```bash
-docker logs synapcores
-```
-
-Copy the `aidb_…` API key it shows. It is your credential on your own machine —
-the plugin only ever sends it to your local gateway, never anywhere else.
-
-**2. Export the key:**
+**2. Export the key and the gateway URL:**
 
 ```bash
 export SYNAPCORES_API_KEY="aidb_…"
 export SYNAPCORES_URL="http://127.0.0.1:8080"
 ```
 
-**3. Check it answers:**
-
-```bash
-curl -s "$SYNAPCORES_URL/health"
-# {"status":"ok","timestamp":"…"}
-```
+The first `MEMORY_STORE` below doubles as your connectivity check — a `401`
+means the key is wrong, and a connection error means the gateway is not up yet.
 
 ## Usage
 
@@ -197,4 +187,4 @@ curl -s -H "Authorization: Bearer $SYNAPCORES_API_KEY" "$SYNAPCORES_URL/v1/memor
 | recall returns nothing | wrong namespace, or nothing stored yet — `sc "SELECT COUNT(*) FROM _memory_default"` |
 | SQL error naming your text as a column | double quotes used for a string — use single quotes |
 
-Verified against SynapCores v1.14.2-ce.
+Verified against SynapCores v2.5.1-ce.
