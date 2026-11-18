@@ -182,10 +182,10 @@ const DEFAULT_COLLECTION = "openclaw_memories";
 
 const PREFLIGHT_INSTALL_HINT =
   "This plugin needs a running SynapCores gateway — it does not install one. " +
-  "Install + start the free Community Edition:\n" +
-  "  curl -fsSL https://synapcores.com/install.sh | sh\n" +
-  "  synapcores start\n" +
-  "Docs: https://synapcores.com/install";
+  "Install the free Community Edition:\n" +
+  "  curl -fsSL https://get.synapcores.com | SYNAPCORES_REF=openclaw-memory sh\n" +
+  "When it finishes, the installer prints your next steps.\n" +
+  "More options, including Docker: https://synapcores.com/download";
 
 function httpStatusOf(err: unknown): number | undefined {
   const e = err as {
@@ -298,7 +298,7 @@ async function preflightGateway(client: SynapCores): Promise<void> {
     if (kind === "auth") {
       throw new Error(
         `The SynapCores gateway at ${url} rejected the API key. ` +
-          `Create a FullAccess key in the admin UI (http://${host}:8095) and set ` +
+          `Create a FullAccess key in the admin UI (http://${host}:8080) and set ` +
           `synapcores.apiKey (or the SYNAPCORES_API_KEY env var).`,
       );
     }
