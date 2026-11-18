@@ -233,6 +233,10 @@ class FakeMemoryObjects {
   /** `${memory}|${identity}|${attribute}` -> claims. Two claims = a conflict. */
   public state = new Map<string, Array<{ value: string; confidence: number; authority: string }>>();
   public calls: Array<{ path: string; body: unknown }> = [];
+  /** FORGET calls served so far (lets SQL failure injection key off "before/after the forget"). */
+  public forgetCount = 0;
+  /** Report this many MORE deleted episodes than FORGET actually removed. */
+  public inflateForgetCount = 0;
 
   private episodeCounter = 0;
 
@@ -498,6 +502,7 @@ class FakeMemoryObjects {
   forget(name: string, body: any) {
     this.requireObject(name);
     const identity = this.resolveIdentity(body?.identity);
+    this.forgetCount += 1;
     const before = this.episodes.length;
     if (typeof body?.memory_id === "string") {
       this.episodes = this.episodes.filter(
@@ -509,7 +514,7 @@ class FakeMemoryObjects {
         (e) => !(e.identity === identity && cosineSim(aVec, deterministicEmbed(e.content)) >= 0.3),
       );
     }
-    const removed = before - this.episodes.length;
+    const removed = before - this.episodes.length + this.inflateForgetCount;
     return this.envelope("FORGET", name, identity, removed > 0 ? "completed" : "not_found", {
       scope: body?.about ?? body?.memory_id,
       affected: {
@@ -652,9 +657,28 @@ class FakeGraph {
   public nodeIndexByUserId = new Map<string, FakeGraphNode>();
   public cypherCalls: CypherCall[] = [];
   public readonly nodes: FakeGraphNodesApi;
+  /** Graph-service outage injection for the copy-cleanup statements. */
+  public failDeletes = false;
+  public failCounts = false;
 
   constructor() {
     this.nodes = new FakeGraphNodesApi(this);
+  }
+
+  /** `Memory` nodes whose `id` property is one of `ids` (all of them when `ids` is undefined). */
+  memoryCopies(ids?: string[]): FakeGraphNode[] {
+    const wanted = ids === undefined ? undefined : new Set(ids);
+    return this.allNodes.filter(
+      (n) => n.labels.includes("Memory") && (!wanted || wanted.has(String(n.properties.id))),
+    );
+  }
+
+  /** Add a `Memory` copy directly, as linkSimilarMemories would have. */
+  addMemoryCopy(id: string, text = "copy"): void {
+    const node: FakeGraphNode = { id, labels: ["Memory"], properties: { id, text } };
+    this.allNodes.push(node);
+    this.nodeIndexById.set(id, node);
+    this.nodeIndexByUserId.set(id, node);
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -667,6 +691,32 @@ class FakeGraph {
         )}.`,
       );
     }
+    // Graph-copy cleanup (0.8.8): count / delete `Memory` nodes by an id list,
+    // and count every `Memory` node.
+    //   MATCH (m:Memory) WHERE m.id IN ['a', 'b'] RETURN count(m) AS n
+    //   MATCH (m:Memory) WHERE m.id IN ['a', 'b'] DETACH DELETE m
+    //   MATCH (m:Memory) RETURN count(m) AS n
+    const inList = query.match(/^MATCH \(m:Memory\) WHERE m\.id IN \[(.*)\] (RETURN count\(m\) AS n|DETACH DELETE m)$/);
+    if (inList) {
+      const ids = [...inList[1].matchAll(/'([^']*)'/g)].map((x) => x[1]);
+      if (inList[2] === "DETACH DELETE m") {
+        if (this.failDeletes) throw new Error("graph service unavailable (delete)");
+        const doomed = new Set(this.memoryCopies(ids));
+        this.allNodes = this.allNodes.filter((n) => !doomed.has(n));
+        for (const n of doomed) {
+          this.nodeIndexById.delete(n.id);
+          this.nodeIndexByUserId.delete(String(n.properties.id));
+        }
+        return { columns: ["m"], rows: [...doomed].map((n) => [n]), records: [] };
+      }
+      if (this.failCounts) throw new Error("graph service unavailable (count)");
+      return { columns: ["n"], rows: [[this.memoryCopies(ids).length]], records: [] };
+    }
+    if (query === "MATCH (m:Memory) RETURN count(m) AS n") {
+      if (this.failCounts) throw new Error("graph service unavailable (count)");
+      return { columns: ["n"], rows: [[this.memoryCopies().length]], records: [] };
+    }
+
     // Recognise the recallRelated MATCH pattern. The plugin emits:
     //   MATCH (start:Memory {id: 'X'})-[:SIMILAR_TO > T]-(related:Memory) RETURN DISTINCT related LIMIT N
     const m = query.match(/MATCH \(start:Memory \{id: '((?:\\.|[^'\\])*)'\}\)-\[:SIMILAR_TO > ([0-9.]+)\]-\(related:Memory\)/);
@@ -761,6 +811,19 @@ class FakeSynapCores {
   // Synthetic in-memory SQL tables for executeQuery
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public sqlTables = new Map<string, Array<Record<string, any>>>();
+  /**
+   * Episode-inventory failure injection: fail the inventory SELECT before the
+   * first FORGET, after it, or always.
+   */
+  public failInventory: "none" | "before-forget" | "after-forget" | "always" = "none";
+  /** Every episode-inventory statement the plugin sent. */
+  public inventorySql: string[] = [];
+  /**
+   * The engine caches SELECT results by statement and a FORGET does not
+   * invalidate them (seen live on 2.5.0-ce). Reproduced for the inventory:
+   * re-sending an identical statement returns the cached, stale rows.
+   */
+  private inventoryCache = new Map<string, unknown[][]>();
 
   constructor() {
     this.memory = new FakeMemoryClient(this);
@@ -870,6 +933,38 @@ class FakeSynapCores {
       rows.push(row);
       this.sqlTables.set(t, rows);
       return { columns: [], rows: [], rows_affected: 1, execution_time_ms: 0 };
+    }
+
+    // Scope-forget episode inventory (0.8.8): keyset-paginated ids, with a
+    // per-call nonce predicate so the engine's result cache never answers it.
+    m = sql.match(
+      /^SELECT id FROM _mem_(\w+)_episodes WHERE (?:identity = '((?:[^']|'')*)' AND )?id > '((?:[^']|'')*)' AND id <> '((?:[^']|'')*)' ORDER BY id LIMIT (\d+)$/,
+    );
+    if (m) {
+      this.inventorySql.push(sql);
+      const forgotten = this.memoryObjects.forgetCount > 0;
+      if (
+        this.failInventory === "always" ||
+        (this.failInventory === "before-forget" && !forgotten) ||
+        (this.failInventory === "after-forget" && forgotten)
+      ) {
+        throw new Error("query engine unavailable");
+      }
+      const cached = this.inventoryCache.get(sql);
+      if (cached) {
+        return { columns: [{ name: "id", data_type: "TEXT", nullable: true }], rows: cached, execution_time_ms: 0 };
+      }
+      const identity = m[2]?.replace(/''/g, "'");
+      const after = m[3].replace(/''/g, "'");
+      const limit = Number(m[5]);
+      const rows = this.memoryObjects.episodes
+        .filter((e) => (identity === undefined || e.identity === identity) && e.id > after)
+        .map((e) => e.id)
+        .sort()
+        .slice(0, limit)
+        .map((id) => [id]);
+      this.inventoryCache.set(sql, rows);
+      return { columns: [{ name: "id", data_type: "TEXT", nullable: true }], rows, execution_time_ms: 150 };
     }
 
     // The memory object materializes five ORDINARY tables; the plugin reads
@@ -2446,11 +2541,287 @@ describe("memory plugin end-to-end (mocked SDK)", () => {
 
     expect(result.details.action).toBe("forgot_scope");
     expect(result.details.affected.episodes).toBe(1);
+    expect(result.details.forgottenCount).toBe(1);
+    expect(result.details.graphCleanup).toBe("removed");
     // The unrelated memory survived; the address is gone.
     expect(fake.memoryObjects.episodes.length).toBe(1);
     expect(fake.memoryObjects.episodes[0].content).toMatch(/build tooling/);
     // No candidate-listing dance — the engine resolved the scope itself.
     expect(result.details.candidates).toBeUndefined();
+  });
+
+  // --------------------------------------------------------------------------
+  // Scope-forget graph-copy cleanup (0.8.8). The ids to clean up come from the
+  // authoritative episode inventory diffed around the FORGET — never from a
+  // capped semantic recall, whose 25-result limit used to leave copies behind.
+  // --------------------------------------------------------------------------
+
+  const recallCalls = (fake: FakeSynapCores) =>
+    fake.memoryObjects.calls.filter((c) => c.path.endsWith("/recall")).length;
+
+  test("scope forget removes the graph copy of every forgotten memory, well past the old 25-result recall cap", async () => {
+    const { fake, tool } = await registerWithMemoryObject({ autoLinkSimilar: true });
+    for (let i = 0; i < 40; i++) {
+      await tool("memory_store").execute(`s${i}`, {
+        text: `Project Falcon launch checklist item ${i}`,
+      });
+    }
+    await tool("memory_store").execute("u1", { text: "Completely unrelated build tooling note" });
+    await tool("memory_store").execute("u2", { text: "Gardening schedule for tomatoes" });
+    const falconIds = fake.memoryObjects.episodes
+      .filter((e) => e.content.includes("Falcon"))
+      .map((e) => e.id);
+    expect(falconIds.length).toBe(40);
+    expect(fake.graph.memoryCopies(falconIds).length).toBe(40);
+    const recallsBefore = recallCalls(fake);
+
+    const result = await tool("memory_forget").execute("f1", {
+      query: "Project Falcon launch checklist",
+    });
+
+    expect(result.details.action).toBe("forgot_scope");
+    expect(result.details.affected.episodes).toBe(40);
+    // The report matches what actually happened in the graph.
+    expect(result.details.forgottenCount).toBe(40);
+    expect(result.details.graphCopiesRemoved).toBe(40);
+    expect(result.details.graphCleanup).toBe("removed");
+    expect(result.details.forgottenIds).toBeUndefined();
+    expect(fake.graph.memoryCopies(falconIds)).toEqual([]);
+    // The two unrelated memories and their graph copies are untouched.
+    expect(fake.memoryObjects.episodes.length).toBe(2);
+    expect(fake.graph.memoryCopies().length).toBe(2);
+    // Semantic recall is not the deletion inventory.
+    expect(recallCalls(fake)).toBe(recallsBefore);
+    // Every inventory statement is unique, so the engine's result cache (which
+    // a FORGET does not invalidate; the fake reproduces it) never answers one.
+    expect(new Set(fake.inventorySql).size).toBe(fake.inventorySql.length);
+  });
+
+  test("the episode inventory pages through every stored memory (1,200 episodes, 500 per page)", async () => {
+    const { fake, tool } = await registerWithMemoryObject({ autoLinkSimilar: true });
+    await tool("memory_store").execute("seed", { text: "Seed memory about kayaking trips" });
+    for (let i = 0; i < 1200; i++) {
+      const id = `ep_bulk_${String(i).padStart(4, "0")}`;
+      fake.memoryObjects.episodes.push({
+        id,
+        identity: PINNED_USER,
+        content: `Orion telescope observation log entry ${i}`,
+        sourceType: "user_statement",
+        recordedAt: new Date(),
+      });
+      fake.graph.addMemoryCopy(id);
+    }
+
+    const result = await tool("memory_forget").execute("f", {
+      query: "Orion telescope observation log entry",
+    });
+
+    expect(result.details.affected.episodes).toBe(1200);
+    expect(result.details.forgottenCount).toBe(1200);
+    expect(result.details.graphCopiesRemoved).toBe(1200);
+    expect(result.details.graphCleanup).toBe("removed");
+    // Only the kayaking memory's copy is left.
+    expect(fake.graph.memoryCopies().length).toBe(1);
+    // 1,201 ids at 500 per page = 3 pages before the FORGET, 1 page after it
+    // (only the kayaking memory is left), each narrowed to the caller's own
+    // (credential-pinned) identity.
+    expect(fake.inventorySql.length).toBe(4);
+    expect(fake.inventorySql.every((s) => s.includes(`identity = '${PINNED_USER}'`))).toBe(true);
+  });
+
+  test("graph cleanup targets episode ids only — recalled fact ids are never used as graph keys", async () => {
+    const { fake, tool } = await registerWithMemoryObject({ autoLinkSimilar: true });
+    for (let i = 0; i < 3; i++) {
+      await tool("memory_store").execute(`s${i}`, { text: `Billing address detail ${i} for invoices` });
+    }
+    // REMEMBER returns derived FACT ids (mem_…) beside the episode id (ep_…);
+    // only the episode id keys a graph copy. A node under a fact id is not a
+    // copy of a forgotten episode and must not be what cleanup aims at.
+    const factId = `mem_${fake.memoryObjects.episodes[0].id.slice(3)}`;
+    fake.graph.addMemoryCopy(factId);
+
+    const result = await tool("memory_forget").execute("f", {
+      query: "Billing address detail for invoices",
+    });
+
+    const targeted = fake.graph.cypherCalls
+      .map((c) => c.query)
+      .filter((q) => q.includes("WHERE m.id IN"))
+      .flatMap((q) => [...q.matchAll(/'([^']*)'/g)].map((x) => x[1]));
+    expect(targeted.length).toBeGreaterThan(0);
+    expect(targeted.every((id) => id.startsWith("ep_"))).toBe(true);
+    expect(result.details.graphCopiesRemoved).toBe(3);
+    expect(result.details.graphCleanup).toBe("removed");
+    expect(fake.graph.memoryCopies([factId]).length).toBe(1);
+  });
+
+  test("an unreadable inventory deletes NOTHING while graph copies exist, and says why", async () => {
+    const { fake, tool } = await registerWithMemoryObject({ autoLinkSimilar: true });
+    await tool("memory_store").execute("s1", { text: "My home address is 42 Elm Street" });
+    fake.failInventory = "always";
+
+    const result = await tool("memory_forget").execute("f", { query: "My home address" });
+
+    expect(result.details.action).toBe("none");
+    expect(result.details.error).toBe("MEMORY_INVENTORY_UNAVAILABLE");
+    expect(result.content[0].text).toMatch(/Nothing was forgotten/);
+    expect(fake.memoryObjects.forgetCount).toBe(0);
+    expect(fake.memoryObjects.episodes.length).toBe(1);
+    expect(fake.graph.memoryCopies().length).toBe(1);
+  });
+
+  test("an unreadable inventory does not block a forget when the graph holds no copies at all", async () => {
+    const { fake, tool } = await registerWithMemoryObject();
+    await tool("memory_store").execute("s1", { text: "My home address is 42 Elm Street" });
+    fake.failInventory = "always";
+
+    const result = await tool("memory_forget").execute("f", { query: "My home address" });
+
+    expect(result.details.action).toBe("forgot_scope");
+    expect(result.details.affected.episodes).toBe(1);
+    // Verified: the graph had no Memory copy to leave behind.
+    expect(result.details.graphCleanup).toBe("removed");
+    expect(fake.memoryObjects.episodes.length).toBe(0);
+  });
+
+  test("a graph outage during cleanup is reported as failed:<n> with the ids to retry, and a by-id retry finishes it", async () => {
+    const { fake, tool } = await registerWithMemoryObject({ autoLinkSimilar: true });
+    for (let i = 0; i < 3; i++) {
+      await tool("memory_store").execute(`s${i}`, { text: `Weekend hiking plan note ${i}` });
+    }
+    fake.graph.failDeletes = true;
+
+    const result = await tool("memory_forget").execute("f", { query: "Weekend hiking plan note" });
+
+    expect(result.details.affected.episodes).toBe(3);
+    expect(result.details.graphCleanup).toBe("failed:3");
+    expect(result.details.graphCopiesRemoved).toBe(0);
+    expect(result.details.forgottenIds).toHaveLength(3);
+    expect(result.content[0].text).toMatch(/may remain recallable/);
+    expect(fake.graph.memoryCopies().length).toBe(3);
+
+    fake.graph.failDeletes = false;
+    for (const id of result.details.forgottenIds as string[]) {
+      const retry = await tool("memory_forget").execute(`r-${id}`, { memoryId: id });
+      expect(retry.details.graphCleanup).toBe("removed");
+    }
+    expect(fake.graph.memoryCopies().length).toBe(0);
+  });
+
+  test("a graph that cannot be queried leaves the cleanup unverified, never 'removed'", async () => {
+    const { fake, tool } = await registerWithMemoryObject({ autoLinkSimilar: true });
+    await tool("memory_store").execute("s1", { text: "Dentist appointment on Friday" });
+    fake.graph.failCounts = true;
+
+    const result = await tool("memory_forget").execute("f", { query: "Dentist appointment on Friday" });
+
+    expect(result.details.affected.episodes).toBe(1);
+    expect(result.details.graphCleanup).toBe("unverified");
+    expect(result.content[0].text).toMatch(/could not confirm/);
+  });
+
+  test("an inventory that fails after the FORGET is unverified when copies were at risk, verified when none were", async () => {
+    const withCopies = await registerWithMemoryObject({ autoLinkSimilar: true });
+    await withCopies.tool("memory_store").execute("s1", { text: "Car service booking reminder" });
+    withCopies.fake.failInventory = "after-forget";
+    const risky = await withCopies.tool("memory_forget").execute("f", {
+      query: "Car service booking reminder",
+    });
+    expect(risky.details.affected.episodes).toBe(1);
+    expect(risky.details.graphCleanup).toBe("unverified");
+    expect(risky.content[0].text).toMatch(/could not re-read the memory inventory/);
+
+    const noCopies = await registerWithMemoryObject();
+    await noCopies.tool("memory_store").execute("s1", { text: "Car service booking reminder" });
+    noCopies.fake.failInventory = "after-forget";
+    const safe = await noCopies.tool("memory_forget").execute("f", {
+      query: "Car service booking reminder",
+    });
+    expect(safe.details.graphCleanup).toBe("removed");
+  });
+
+  test("an engine receipt larger than the inventory diff is reported as unverified", async () => {
+    const { fake, tool } = await registerWithMemoryObject({ autoLinkSimilar: true });
+    await tool("memory_store").execute("s1", { text: "Piano lesson schedule" });
+    // The engine says it deleted one more episode than left the inventory —
+    // as when a memory is stored between the inventory and the FORGET.
+    fake.memoryObjects.inflateForgetCount = 1;
+
+    const result = await tool("memory_forget").execute("f", { query: "Piano lesson schedule" });
+
+    expect(result.details.forgottenCount).toBe(1);
+    expect(result.details.graphCleanup).toBe("unverified");
+    expect(result.content[0].text).toMatch(/stored while the forget ran/);
+  });
+
+  test("forget by id verifies its graph copy is gone, and reports a copy it could not remove", async () => {
+    const { fake, tool } = await registerWithMemoryObject({ autoLinkSimilar: true });
+    const kept = await tool("memory_store").execute("s1", { text: "I prefer dark mode" });
+    expect(fake.graph.memoryCopies([kept.details.id]).length).toBe(1);
+    const ok = await tool("memory_forget").execute("f1", { memoryId: kept.details.id });
+    expect(ok.details.graphCleanup).toBe("removed");
+    expect(fake.graph.memoryCopies().length).toBe(0);
+
+    const stuck = await tool("memory_store").execute("s2", { text: "I prefer tabs over spaces" });
+    fake.graph.failDeletes = true;
+    const failed = await tool("memory_forget").execute("f2", { memoryId: stuck.details.id });
+    expect(failed.details.graphCleanup).toBe("failed");
+    expect(failed.content[0].text).toMatch(/could not be removed/);
+  });
+
+  // --------------------------------------------------------------------------
+  // Gateway transport security (0.8.8)
+  // --------------------------------------------------------------------------
+
+  test("register() refuses a remote plain-HTTP gateway before building the SDK client", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const { mockApi } = buildMockApi({
+      synapcores: { host: "memory.example.com", port: 8080, apiKey: SYNAPCORES_API_KEY },
+    });
+    let message = "";
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      memoryPlugin.register(mockApi as any);
+    } catch (err) {
+      message = String((err as Error).message);
+    }
+    expect(message).toMatch(/synapcores\.useHttps: true/);
+    expect(message).toMatch(/synapcores\.allowInsecureHttp: true/);
+    // The refusal never echoes the credential.
+    expect(message).not.toContain(SYNAPCORES_API_KEY);
+    // No client was constructed, so nothing went out on the network.
+    expect(mockState.lastFake).toBeNull();
+  });
+
+  test("the allowInsecureHttp opt-in connects with a startup warning; loopback and HTTPS log none", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+    const warned = (logs: string[]) =>
+      logs.some((l) => l.startsWith("[warn]") && l.includes("allowInsecureHttp is set"));
+
+    const optIn = buildMockApi({
+      synapcores: {
+        host: "10.0.0.5",
+        port: 8080,
+        apiKey: SYNAPCORES_API_KEY,
+        allowInsecureHttp: true,
+      },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(optIn.mockApi as any);
+    expect(mockState.lastFake).not.toBeNull();
+    expect(warned(optIn.logs)).toBe(true);
+
+    const https = buildMockApi({
+      synapcores: { host: "memory.example.com", port: 443, apiKey: SYNAPCORES_API_KEY, useHttps: true },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(https.mockApi as any);
+    expect(warned(https.logs)).toBe(false);
+
+    const loopback = buildMockApi();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    memoryPlugin.register(loopback.mockApi as any);
+    expect(warned(loopback.logs)).toBe(false);
   });
 
   test("memory_forget by id issues FORGET MEMORY and reports propagation", async () => {
@@ -2861,6 +3232,105 @@ describe("escapeCypherString", () => {
       i++;
     }
     expect(cypher.slice(i)).toBe("'}) RETURN n");
+  });
+});
+
+describe("gateway transport security (0.8.8)", () => {
+  const parse = async (synapcores: Record<string, unknown>) => {
+    const { default: memoryPlugin } = await import("./index.js");
+    return memoryPlugin.configSchema!.parse!({ synapcores }) as {
+      synapcores: { host: string; useHttps: boolean; allowInsecureHttp: boolean };
+    };
+  };
+
+  test("a remote gateway over plain HTTP is refused at config validation", async () => {
+    for (const host of [
+      "memory.example.com",
+      "synapcores",
+      "10.0.0.5",
+      "192.168.1.20",
+      "0.0.0.0",
+      "128.0.0.1",
+      "gateway.localhost",
+      "::2",
+      "[2001:db8::1]",
+    ]) {
+      await expect(parse({ host })).rejects.toThrow(
+        /synapcores\.useHttps: true[\s\S]*synapcores\.allowInsecureHttp: true/,
+      );
+    }
+  });
+
+  test("loopback stays allowed over HTTP with no extra setting (the default localhost:8080 keeps working)", async () => {
+    const defaults = await parse({});
+    expect(defaults.synapcores.host).toBe("localhost");
+    expect(defaults.synapcores.useHttps).toBe(false);
+    expect(defaults.synapcores.allowInsecureHttp).toBe(false);
+    for (const host of [
+      "localhost",
+      "LOCALHOST",
+      "localhost.",
+      "127.0.0.1",
+      "127.12.34.56",
+      "::1",
+      "[::1]",
+      "0:0:0:0:0:0:0:1",
+      "::ffff:127.0.0.1",
+    ]) {
+      await expect(parse({ host })).resolves.toBeDefined();
+    }
+  });
+
+  test("a remote gateway is accepted over HTTPS, or over HTTP with the explicit allowInsecureHttp opt-in", async () => {
+    const tls = await parse({ host: "memory.example.com", useHttps: true });
+    expect(tls.synapcores.useHttps).toBe(true);
+    expect(tls.synapcores.allowInsecureHttp).toBe(false);
+    const optIn = await parse({ host: "10.0.0.5", allowInsecureHttp: true });
+    expect(optIn.synapcores.useHttps).toBe(false);
+    expect(optIn.synapcores.allowInsecureHttp).toBe(true);
+  });
+
+  test("the flags must be real booleans, and a URL in host is refused with guidance", async () => {
+    await expect(parse({ host: "10.0.0.5", allowInsecureHttp: "true" })).rejects.toThrow(
+      /allowInsecureHttp must be true or false/,
+    );
+    await expect(parse({ host: "memory.example.com", useHttps: "yes" })).rejects.toThrow(
+      /useHttps must be true or false/,
+    );
+    for (const host of [
+      "http://10.0.0.5",
+      "https://memory.example.com",
+      "memory.example.com/v1",
+      "localhost:8080",
+    ]) {
+      await expect(parse({ host, useHttps: true })).rejects.toThrow(/bare hostname or IP address/);
+    }
+  });
+
+  test("a host supplied through ${ENV} is resolved and checked like any other", async () => {
+    process.env.TEST_SC_GATEWAY_HOST = "memory.example.com";
+    try {
+      await expect(parse({ host: "${TEST_SC_GATEWAY_HOST}" })).rejects.toThrow(/remote gateway/);
+      const tls = await parse({ host: "${TEST_SC_GATEWAY_HOST}", useHttps: true });
+      expect(tls.synapcores.host).toBe("memory.example.com");
+      process.env.TEST_SC_GATEWAY_HOST = "127.0.0.1";
+      const local = await parse({ host: "${TEST_SC_GATEWAY_HOST}" });
+      expect(local.synapcores.host).toBe("127.0.0.1");
+    } finally {
+      delete process.env.TEST_SC_GATEWAY_HOST;
+    }
+    await expect(parse({ host: "${TEST_SC_GATEWAY_HOST}" })).rejects.toThrow(/is not set/);
+  });
+
+  test("isLoopbackHost recognises 127.0.0.0/8, ::1 and localhost only", async () => {
+    const { isLoopbackHost } = await import("./config.js");
+    expect(isLoopbackHost("localhost")).toBe(true);
+    expect(isLoopbackHost("127.255.255.254")).toBe(true);
+    expect(isLoopbackHost("[0000::1]")).toBe(true);
+    expect(isLoopbackHost("localhost.example.com")).toBe(false);
+    expect(isLoopbackHost("127.0.0.1.nip.io")).toBe(false);
+    expect(isLoopbackHost("::ffff:10.0.0.1")).toBe(false);
+    expect(isLoopbackHost("")).toBe(false);
   });
 });
 

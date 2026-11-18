@@ -17,6 +17,15 @@ A long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) t
 > long-term memory of personal conversation details; enable it deliberately. See
 > [Privacy & data handling](#privacy--data-handling).
 
+> **0.8.8 — encrypted transport for remote gateways, complete forget.** A gateway
+> on another machine connects over HTTPS (`synapcores.useHttps: true`), or over
+> plain HTTP when you set `synapcores.allowInsecureHttp: true` for a private
+> network you trust. A gateway on this machine, including the default
+> `localhost:8080`, works exactly as before. See
+> [Gateway on another machine](#gateway-on-another-machine). A `memory_forget`
+> by query now removes the graph copy of every memory it deletes, however many
+> there are, and reports the cleanup only once a recount confirms it.
+
 > **0.8.0 shipping note — the full memory-object surface.** The `CREATE MEMORY`
 > backend introduced in 0.7.0 is now reachable end to end:
 >
@@ -199,6 +208,33 @@ Then `openclaw config validate`. Environment-variable interpolation
 so you don't have to commit secrets. (Store keys **clean** — a trailing newline
 in `apiKey` will break auth.)
 
+### Gateway on another machine
+
+The config above talks to a gateway on this machine, and any loopback host
+(`localhost`, `127.0.0.0/8`, `::1`) works over plain HTTP exactly as shown. When
+the gateway runs on another machine, serve it over TLS (a reverse proxy in front
+of port 8080 is the usual way) and point the plugin at its HTTPS address, so your
+API key and memories stay encrypted on the network:
+
+```json
+"synapcores": {
+  "host": "memory.example.com",
+  "port": 443,
+  "apiKey": "${SYNAPCORES_API_KEY}",
+  "useHttps": true
+}
+```
+
+`host` takes a bare hostname or IP address; the scheme comes from `useHttps` and
+the port from `port`.
+
+For a gateway on a private network you trust that has no TLS yet (a
+docker-compose service, a box on your LAN, a VPN peer), add
+`"allowInsecureHttp": true` to the `synapcores` block to connect over plain HTTP;
+the plugin logs a reminder at each startup. A gateway on another machine needs
+one of these two settings: without either, config validation stops with a
+message that names both, before the plugin opens any connection.
+
 ## Privacy & data handling
 
 This plugin is **privacy-safe by default and passive out of the box.**
@@ -224,13 +260,18 @@ This plugin is **privacy-safe by default and passive out of the box.**
   pre-compaction memory-flush capability when `autoCapture` is enabled; with the
   default off, the agent is never prompted to store facts automatically.
 - **You control your data.** Review memories with `memory_recall` / `ltm`, and
-  delete them by id or query with `memory_forget` (GDPR-style forget).
+  delete them by id or query with `memory_forget` (GDPR-style forget). A forget
+  also removes the graph copy `autoLinkSimilar` made of each forgotten memory,
+  and its result reports that cleanup in `details.graphCleanup`.
 - **No third-party egress or telemetry.** The plugin talks to exactly one
   endpoint — the **SynapCores gateway you configure** (`synapcores.host` /
   `apiKey`). It sends no analytics, usage data, or conversation content anywhere
   else. Your memories live in your own self-hosted database.
-- **Prefer HTTPS + a controlled gateway.** Set `synapcores.useHttps: true` for
-  any non-localhost gateway so memory content is encrypted in transit.
+- **Encrypted whenever it leaves the machine.** A gateway on this machine is
+  reached over loopback, and a gateway anywhere else over HTTPS
+  (`synapcores.useHttps: true`). Plain HTTP to another machine happens only when
+  you opt in with `synapcores.allowInsecureHttp: true` — see
+  [Gateway on another machine](#gateway-on-another-machine).
 - **Don't store secrets or regulated data** in shared or sensitive workspaces,
   and confirm you can review/delete memories before enabling auto-capture there.
 
@@ -241,7 +282,8 @@ This plugin is **privacy-safe by default and passive out of the box.**
 | `synapcores.apiKey` | yes | — | SynapCores API key (`ak_prod_…` or `aidb_…`). |
 | `synapcores.host` | no | `localhost` | SynapCores gateway hostname. |
 | `synapcores.port` | no | `8080` | SynapCores gateway port. |
-| `synapcores.useHttps` | no | `false` | Use TLS to talk to the gateway. |
+| `synapcores.useHttps` | no | `false` | Use TLS to talk to the gateway. Set it for any gateway that is not on this machine. |
+| `synapcores.allowInsecureHttp` | no | `false` | Connect to a gateway on another machine over plain HTTP. For a private network you trust; loopback hosts never need it. |
 | `collection` | no | `openclaw_memories` | SynapCores collection name. Also the default name of the `CREATE MEMORY` object. |
 | `graph` | no | `openclaw_memory_graph` | SynapCores graph name (used for `SIMILAR_TO` edges and `recallRelated` walks). |
 | `memory.backend` | no | `auto` | `auto` \| `memory-object` \| `legacy`. `auto` probes once and picks; `memory-object` fails loudly on an engine older than v1.14.3-ce; `legacy` never probes. |
@@ -329,7 +371,7 @@ Once registered, the plugin:
 | --- | --- |
 | `memory_recall` | Retrieve relevant memory. Params: `{ query: string, limit?: number }` (default 5). On the memory-object backend this is `RECALL`: the reply text is the engine's `context.prompt_ready` projection, and `details` keeps `currentState` separate from the ranked list. On legacy it is a vector search. |
 | `memory_store` | Persist a memory. Params: `{ text, importance?, category? }`. Legacy de-dupes client-side against >0.95 cosine similarity; the memory-object backend does not, because the engine owns dedup. **`importance` and `category` are not persisted on the memory-object backend** (see MIGRATION.md §6). |
-| `memory_forget` | Delete by `memoryId`, or by `query`. On the memory-object backend a query issues `FORGET … ABOUT` and returns the per-category counts the engine removed; on legacy it auto-deletes a single >0.9 match and otherwise returns candidates. |
+| `memory_forget` | Delete by `memoryId`, or by `query`. On the memory-object backend a query issues `FORGET … ABOUT`, returns the per-category counts the engine removed, and removes the graph copy of every memory it deleted, however many there were. `details.graphCleanup` is `removed` once a recount confirms no copy is left (`failed:<n>` or `unverified` otherwise, with `details.forgottenIds` to finish by id). On legacy it auto-deletes a single >0.9 match and otherwise returns candidates. |
 | `memory_current` | **v1.14.3-ce+.** The authoritative current value of one attribute. Params: `{ attribute: string }`. Deterministic, never a similarity search. Returns the value with its authority and `valid_from`, or `not_found`, or `conflict` with both competing claims — which the engine deliberately does not resolve. |
 | `memory_trace` | **v1.14.3-ce+.** Why a value is believed. Params: `{ attribute: string }`. Returns the source statement verbatim, recorded-vs-event time, extraction method, confidence and what it superseded. |
 | `memory_history` | **v1.14.3-ce+ (plugin 0.8.0).** The timeline of how an attribute's value changed over time. Params: `{ attribute?: string, limit?: number }` — omit `attribute` for a recent cross-attribute timeline. Use it for "what did I used to think" rather than the current value or related context. |

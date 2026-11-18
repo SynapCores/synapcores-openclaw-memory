@@ -1,3 +1,5 @@
+import { BlockList, isIP } from "node:net";
+
 /**
  * Which engine surface backs the plugin's memory operations.
  *
@@ -77,6 +79,12 @@ export type MemoryConfig = {
     port: number;
     apiKey: string;
     useHttps: boolean;
+    /**
+     * Explicit opt-in to plain HTTP for a NON-loopback gateway. Off by default:
+     * a remote host needs `useHttps: true` unless the operator sets this.
+     * Loopback hosts never need it.
+     */
+    allowInsecureHttp: boolean;
   };
   collection?: string;
   graph?: string;
@@ -311,6 +319,102 @@ function parseMemoryBlock(value: unknown): MemoryObjectConfig {
   };
 }
 
+// Loopback ranges: 127.0.0.0/8 and ::1. BlockList compares parsed addresses,
+// so every spelling of ::1 (0:0:0:0:0:0:0:1, 0000::1, ...) matches too.
+const LOOPBACK_RANGES = new BlockList();
+LOOPBACK_RANGES.addSubnet("127.0.0.0", 8, "ipv4");
+LOOPBACK_RANGES.addAddress("::1", "ipv6");
+
+/**
+ * True when `host` can only reach this machine: `localhost`, an address in
+ * 127.0.0.0/8, or ::1 (bracketed or not, plus the IPv4-mapped
+ * `::ffff:127.x.y.z` form). Any other name or address counts as remote,
+ * including names under `.localhost`, because a resolver is not obliged to
+ * keep those on the loopback interface.
+ */
+export function isLoopbackHost(host: string): boolean {
+  let h = String(host ?? "").trim().toLowerCase();
+  if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+  if (h.endsWith(".")) h = h.slice(0, -1);
+  if (h === "localhost") return true;
+  const family = isIP(h);
+  if (family === 4) return LOOPBACK_RANGES.check(h, "ipv4");
+  if (family === 6) {
+    const mapped = h.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+    if (mapped && isIP(mapped[1]) === 4) return LOOPBACK_RANGES.check(mapped[1], "ipv4");
+    return LOOPBACK_RANGES.check(h, "ipv6");
+  }
+  return false;
+}
+
+/**
+ * Refuse a plaintext connection to a remote gateway.
+ *
+ * Every request carries the API key and memory content, so a non-loopback
+ * gateway must be reached over TLS (`useHttps: true`) unless the operator has
+ * explicitly accepted plain HTTP with `allowInsecureHttp: true`. Loopback
+ * traffic never leaves the machine and needs neither. Runs at config parse
+ * time (install, startup, `openclaw plugins doctor`) and again immediately
+ * before the SDK client is built, so no request can go out over a refused
+ * transport.
+ */
+export function assertSecureTransport(gateway: {
+  host: string;
+  port?: number;
+  useHttps: boolean;
+  allowInsecureHttp?: boolean;
+}): void {
+  if (gateway.useHttps || gateway.allowInsecureHttp === true || isLoopbackHost(gateway.host)) {
+    return;
+  }
+  const where = gateway.port === undefined ? gateway.host : `${gateway.host}:${gateway.port}`;
+  throw new Error(
+    `memory-synapcores: synapcores.host '${where}' is a remote gateway, and synapcores.useHttps ` +
+      "is off, so the API key and memory contents would cross the network unencrypted. " +
+      "Serve the gateway over TLS and set synapcores.useHttps: true (recommended). For a " +
+      "gateway on a private network you trust, set synapcores.allowInsecureHttp: true to " +
+      "connect over plain HTTP instead. Loopback hosts (localhost, 127.0.0.0/8, ::1) need " +
+      "neither setting.",
+  );
+}
+
+/**
+ * `synapcores.host` is a bare hostname or IP address. Scheme, port and path
+ * live in `useHttps` / `port`, so a URL here would otherwise be glued into
+ * `http://<url>:<port>` by the SDK.
+ */
+function parseHost(value: unknown): string {
+  if (value === undefined || value === null) {
+    return DEFAULT_HOST;
+  }
+  if (typeof value !== "string") {
+    throw new Error("synapcores.host must be a string");
+  }
+  const host = resolveEnvVars(value.trim());
+  if (host.length === 0) {
+    return DEFAULT_HOST;
+  }
+  // A URL, or `name:port` (one colon, so not an IPv6 address).
+  if (host.includes("://") || /[\s/?#@]/.test(host) || /^[^:]+:\d*$/.test(host)) {
+    throw new Error(
+      `synapcores.host must be a bare hostname or IP address, got '${host}'. Put the hostname ` +
+        "in synapcores.host, the port in synapcores.port, and set synapcores.useHttps: true " +
+        "for an https:// gateway.",
+    );
+  }
+  return host;
+}
+
+function parseOptionalBoolean(value: unknown, label: string): boolean {
+  if (value === undefined || value === null) {
+    return false;
+  }
+  if (typeof value !== "boolean") {
+    throw new Error(`${label} must be true or false`);
+  }
+  return value;
+}
+
 function parsePort(value: unknown): number {
   if (value === undefined) {
     return DEFAULT_PORT;
@@ -345,16 +449,22 @@ export const memoryConfigSchema = {
     const synapcores = (cfg.synapcores ?? {}) as Record<string, unknown>;
     assertAllowedKeys(
       synapcores,
-      ["host", "port", "apiKey", "useHttps"],
+      ["host", "port", "apiKey", "useHttps", "allowInsecureHttp"],
       "synapcores config",
     );
 
-    const host =
-      typeof synapcores.host === "string" && synapcores.host.length > 0
-        ? synapcores.host
-        : DEFAULT_HOST;
+    // Host, port and scheme come from this block only (the plugin reads no
+    // URL from the environment). `${VAR}` in host is resolved here, exactly
+    // like apiKey, so an environment-supplied host passes the same transport
+    // check below.
+    const host = parseHost(synapcores.host);
     const port = parsePort(synapcores.port);
-    const useHttps = synapcores.useHttps === true;
+    const useHttps = parseOptionalBoolean(synapcores.useHttps, "synapcores.useHttps");
+    const allowInsecureHttp = parseOptionalBoolean(
+      synapcores.allowInsecureHttp,
+      "synapcores.allowInsecureHttp",
+    );
+    assertSecureTransport({ host, port, useHttps, allowInsecureHttp });
 
     // The API key may come from config OR from the environment. The README has
     // always documented `${SYNAPCORES_API_KEY}`, but requiring the config key
@@ -377,6 +487,7 @@ export const memoryConfigSchema = {
         port,
         apiKey,
         useHttps,
+        allowInsecureHttp,
       },
       collection: typeof cfg.collection === "string" ? cfg.collection : DEFAULT_COLLECTION,
       graph: typeof cfg.graph === "string" ? cfg.graph : DEFAULT_GRAPH,
@@ -412,7 +523,12 @@ export const memoryConfigSchema = {
     "synapcores.useHttps": {
       label: "Use HTTPS",
       advanced: true,
-      help: "Connect to the SynapCores gateway over TLS",
+      help: "Connect to the SynapCores gateway over TLS. Set this for any gateway that is not on this machine (localhost, 127.0.0.0/8, ::1).",
+    },
+    "synapcores.allowInsecureHttp": {
+      label: "Allow Plain HTTP to a Remote Gateway",
+      advanced: true,
+      help: "Off by default. A gateway that is not on this machine needs useHttps unless this is set. Turn it on only for a gateway on a private network you trust: the API key and memory contents then travel unencrypted.",
     },
     collection: {
       label: "Memory Collection",

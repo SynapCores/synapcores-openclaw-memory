@@ -30,7 +30,7 @@ import { stringEnum } from "openclaw/plugin-sdk/core";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { SILENT_REPLY_TOKEN } from "openclaw/plugin-sdk/reply-runtime";
 import { SynapCores } from "@synapcores/sdk";
-import { MEMORY_CATEGORIES, memoryConfigSchema, } from "./config.js";
+import { MEMORY_CATEGORIES, assertSecureTransport, isLoopbackHost, memoryConfigSchema, } from "./config.js";
 // ============================================================================
 // Constants
 // ============================================================================
@@ -851,6 +851,10 @@ function memoryErrorCode(err) {
 function sqlLiteral(value) {
     return `'${String(value).replace(/'/g, "''")}'`;
 }
+/** Rows per page of the scope-forget episode inventory ({@link MemoryObjectDB.listEpisodeIds}). */
+const EPISODE_INVENTORY_PAGE_SIZE = 500;
+/** Page cap for that inventory (1,000,000 episodes); past it the inventory throws rather than truncates. */
+const EPISODE_INVENTORY_MAX_PAGES = 2000;
 /**
  * Where a call's memory identity comes from, resolved once at registration.
  *
@@ -1153,6 +1157,54 @@ class MemoryObjectDB {
         }
     }
     /**
+     * Every episode id stored in this object (for one identity when `identity` is
+     * known), read from the `_mem_<name>_episodes` table with keyset pagination.
+     *
+     * This is the authoritative inventory scope-forget diffs to learn exactly
+     * which episodes `FORGET … ABOUT` removed: the engine answers that verb with
+     * per-category counts only, and plugin-created `Memory` graph copies are keyed
+     * by episode id. It has no result cap — it pages until the table is
+     * exhausted — and it throws instead of returning a partial list, because a
+     * short inventory would silently leave graph copies behind.
+     *
+     * Every statement carries a per-call nonce predicate. The engine caches slow
+     * SELECT results by plan for several minutes and a FORGET does not invalidate
+     * that cache (observed on 2.5.0-ce: an identical SELECT re-run after FORGET
+     * returned the deleted rows), so each inventory must be a plan the cache has
+     * never seen.
+     */
+    async listEpisodeIds(identity, pageSize = EPISODE_INVENTORY_PAGE_SIZE) {
+        const ids = new Set();
+        const nonce = `inv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+        const scope = identity === undefined ? "" : `identity = ${sqlLiteral(identity)} AND `;
+        let after = "";
+        for (let page = 0; page < EPISODE_INVENTORY_MAX_PAGES; page++) {
+            const result = await this.client.executeQuery({
+                sql: `SELECT id FROM _mem_${this.memoryName}_episodes WHERE ${scope}` +
+                    `id > ${sqlLiteral(after)} AND id <> ${sqlLiteral(nonce)} ` +
+                    `ORDER BY id LIMIT ${pageSize}`,
+            });
+            const rows = result.rows ?? [];
+            let last;
+            for (const row of rows) {
+                const id = Array.isArray(row) ? row[0] : undefined;
+                if (typeof id === "string" && id.length > 0) {
+                    ids.add(id);
+                    last = id;
+                }
+            }
+            if (rows.length < pageSize) {
+                return ids;
+            }
+            if (last === undefined || last === after) {
+                throw new Error(`memory-synapcores: episode inventory of '${this.memoryName}' stopped advancing at page ${page + 1}`);
+            }
+            after = last;
+        }
+        throw new Error(`memory-synapcores: episode inventory of '${this.memoryName}' exceeded ` +
+            `${EPISODE_INVENTORY_MAX_PAGES * pageSize} episodes`);
+    }
+    /**
      * Fetch one episode by id, for callers that hydrate a memory from an id
      * (`trainRelevanceModel`). Same reasoning as `count`: the episodes table is
      * public. `importance` / `category` come back at their defaults because the
@@ -1271,6 +1323,13 @@ class MemoryRouter {
     resolution = null;
     resolvedKind = null;
     warnedNoIsolation = false;
+    /**
+     * The identity the gateway resolved from the credential's pin, as reported by
+     * the startup pin probe (credential mode only). Used solely to narrow the
+     * scope-forget episode inventory to this caller's own rows; the plugin still
+     * never NAMES an identity in a memory verb in credential mode.
+     */
+    credentialIdentity;
     constructor(legacy, objectDb, cfg, identities, logger) {
         this.legacy = legacy;
         this.objectDb = objectDb;
@@ -1391,6 +1450,9 @@ class MemoryRouter {
         try {
             const envelope = await this.objectDb.current(undefined, CREDENTIAL_PIN_PROBE_ATTRIBUTE);
             const resolved = envelope.identity?.value;
+            if (typeof resolved === "string" && resolved.length > 0) {
+                this.credentialIdentity = resolved;
+            }
             if (resolved) {
                 this.logger.debug?.(`memory-synapcores: credential is pinned; the gateway resolves memory identity '${resolved}'`);
             }
@@ -1526,6 +1588,15 @@ class MemoryRouter {
             affected: (data.affected ?? {}),
             status: envelope.status,
         };
+    }
+    /**
+     * The authoritative inventory of stored episode ids for this caller, for
+     * scope-forget's before/after diff. Memory-object backend only (the legacy
+     * backend has no scope forget). Throws rather than returning a partial list.
+     */
+    async listEpisodeIds(identity) {
+        await this.requireObjectBackend("episode inventory");
+        return this.objectDb.listEpisodeIds(identity ?? this.credentialIdentity);
     }
     async count(identity) {
         if ((await this.kind()) === "legacy") {
@@ -1878,6 +1949,246 @@ const SIMILAR_TO_THRESHOLD = 0.5;
 const MAX_HOPS = 4;
 // Default result cap for recallRelated.
 const DEFAULT_RECALL_RELATED_LIMIT = 20;
+/** Ids per `WHERE m.id IN [...]` statement when cleaning up graph copies. */
+const GRAPH_CLEANUP_BATCH = 100;
+/** The shape graph-copy ids must have to be inlined into Cypher (engine ids always do). */
+const GRAPH_COPY_ID = /^[A-Za-z0-9_-]+$/;
+function graphHttp(client) {
+    return client._getHttpClient();
+}
+/** First numeric cell of a `/graph/match` response (`RETURN count(m) AS n`). */
+function graphCountOf(response) {
+    const data = (response?.data ?? response);
+    const raw = Array.isArray(data?.rows?.[0]) ? data.rows[0][0] : undefined;
+    const n = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
+    if (!Number.isFinite(n)) {
+        throw new Error("graph count query returned no numeric count");
+    }
+    return n;
+}
+/** `count(m)` over every `Memory` node in the tenant graph. Throws if the graph cannot answer. */
+async function countAllGraphCopies(client) {
+    return graphCountOf(await graphHttp(client).post("/graph/match", {
+        sql: "MATCH (m:Memory) RETURN count(m) AS n",
+    }));
+}
+/**
+ * Remove the `Memory` graph nodes that `linkSimilarMemories` may have created
+ * for these memory ids, then recount to confirm none is left.
+ *
+ * Runs for every backend: the legacy row delete and the memory-object FORGET
+ * both leave these plugin-created nodes untouched. Ids go in batches of
+ * {@link GRAPH_CLEANUP_BATCH} (`WHERE m.id IN [...]`), so the number of ids is
+ * unbounded. Each batch is counted, deleted, and counted again; a batch with no
+ * copies is not touched. Never throws — failures land in the report, which
+ * callers surface instead of claiming a clean forget.
+ */
+export async function removeGraphCopies(client, ids, logger) {
+    const report = {
+        status: "removed",
+        checked: 0,
+        found: 0,
+        removed: 0,
+        remaining: 0,
+        unverifiable: 0,
+    };
+    const valid = [];
+    for (const id of new Set(ids)) {
+        report.checked++;
+        if (typeof id === "string" && GRAPH_COPY_ID.test(id)) {
+            valid.push(id);
+        }
+        else {
+            // Not safe to inline into Cypher, so its copy cannot be looked up.
+            report.unverifiable++;
+        }
+    }
+    const http = graphHttp(client);
+    for (let i = 0; i < valid.length; i += GRAPH_CLEANUP_BATCH) {
+        const batch = valid.slice(i, i + GRAPH_CLEANUP_BATCH);
+        const inList = batch.map((id) => `'${id}'`).join(", ");
+        const match = `MATCH (m:Memory) WHERE m.id IN [${inList}]`;
+        let found;
+        try {
+            found = graphCountOf(await http.post("/graph/match", { sql: `${match} RETURN count(m) AS n` }));
+        }
+        catch (err) {
+            report.unverifiable += batch.length;
+            logger?.warn?.(`memory-synapcores: graph-copy cleanup could not query ${batch.length} id(s): ${String(err)} (copies may remain)`);
+            continue;
+        }
+        if (found === 0) {
+            continue;
+        }
+        report.found += found;
+        try {
+            await http.post("/graph/match", { sql: `${match} DETACH DELETE m` });
+        }
+        catch (err) {
+            logger?.warn?.(`memory-synapcores: graph-copy cleanup FAILED for ${batch.length} id(s): ${String(err)} (the memories are deleted; ${found} graph copy/copies may remain)`);
+        }
+        try {
+            const left = graphCountOf(await http.post("/graph/match", { sql: `${match} RETURN count(m) AS n` }));
+            report.remaining += left;
+            report.removed += Math.max(0, found - left);
+        }
+        catch (err) {
+            report.unverifiable += batch.length;
+            logger?.warn?.(`memory-synapcores: graph-copy cleanup could not be verified for ${batch.length} id(s): ${String(err)}`);
+        }
+    }
+    report.status =
+        report.unverifiable > 0 ? "unverified" : report.remaining > 0 ? "failed" : "removed";
+    return report;
+}
+/**
+ * Single-id form of {@link removeGraphCopies}: true only when the recount
+ * confirmed the memory has no graph copy left (including when it never had
+ * one), false when a copy remains or the outcome could not be confirmed.
+ */
+async function removeGraphCopy(client, id, logger) {
+    return (await removeGraphCopies(client, [id], logger)).status === "removed";
+}
+/** The `details.graphCleanup` value memory_forget reports for a cleanup report. */
+function graphCleanupLabel(report) {
+    if (report.status === "failed")
+        return `failed:${report.remaining}`;
+    return report.status;
+}
+/** Attempts at the post-FORGET inventory before the cleanup is reported as unverified. */
+const POST_FORGET_INVENTORY_ATTEMPTS = 3;
+/**
+ * `FORGET … ABOUT <scope>` plus removal of every graph copy of every episode
+ * it deleted.
+ *
+ * The engine resolves the scope itself (every in-scope episode above its
+ * similarity threshold — there is no result limit) and answers with counts,
+ * not ids. So the plugin takes the authoritative inventory of stored episode
+ * ids before and after the FORGET and diffs them: the ids that disappeared are
+ * exactly the episodes deleted, however many there were. Their graph copies
+ * are then removed in batches and recounted. Semantic recall is never used as
+ * the deletion inventory (it is capped, and its fact ids are not graph keys).
+ *
+ * Failure handling:
+ * - Inventory unreadable before FORGET: if the graph holds no `Memory` copies
+ *   at all there is nothing to track and the forget proceeds; otherwise
+ *   nothing is deleted and the caller reports why.
+ * - Inventory unreadable after FORGET (after retries): the graph copies of
+ *   every pre-FORGET id are counted; none means the cleanup is verified
+ *   complete, any means it is reported `unverified`.
+ * - The engine reports more deleted episodes than the diff found (an episode
+ *   stored between inventory and FORGET): reported `unverified`.
+ */
+async function forgetScope(router, client, scope, identity, logger) {
+    if ((await router.kind()) === "legacy") {
+        return { kind: "unsupported" };
+    }
+    let before;
+    try {
+        before = await router.listEpisodeIds(identity);
+    }
+    catch (err) {
+        const reason = String(err?.message ?? err);
+        let copies;
+        try {
+            copies = await countAllGraphCopies(client);
+        }
+        catch {
+            copies = undefined;
+        }
+        if (copies !== 0) {
+            return { kind: "inventory_failed", reason };
+        }
+        logger?.warn?.(`memory-synapcores: episode inventory failed (${reason}); the graph holds no Memory copies, so the scope forget proceeds without one`);
+    }
+    const scoped = await router.forgetAbout(scope, identity);
+    const affected = (scoped.affected ?? {});
+    const empty = {
+        status: "removed",
+        checked: 0,
+        found: 0,
+        removed: 0,
+        remaining: 0,
+        unverifiable: 0,
+    };
+    if (before === undefined) {
+        // Verified above that the graph held no copies to track.
+        return { kind: "forgotten", affected, status: scoped.status, forgottenIds: [], graph: empty };
+    }
+    let after;
+    let afterError = "";
+    for (let attempt = 1; attempt <= POST_FORGET_INVENTORY_ATTEMPTS; attempt++) {
+        try {
+            after = await router.listEpisodeIds(identity);
+            break;
+        }
+        catch (err) {
+            afterError = String(err?.message ?? err);
+            if (attempt < POST_FORGET_INVENTORY_ATTEMPTS) {
+                await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+            }
+        }
+    }
+    if (after === undefined) {
+        // Which episodes went is unknown. If none of the pre-FORGET episodes has a
+        // graph copy, none of the deleted ones can have one either.
+        let atRisk;
+        try {
+            atRisk = await countGraphCopiesOf(client, before);
+        }
+        catch {
+            atRisk = undefined;
+        }
+        if (atRisk === 0) {
+            return { kind: "forgotten", affected, status: scoped.status, forgottenIds: [], graph: empty };
+        }
+        logger?.warn?.(`memory-synapcores: could not re-read the episode inventory after FORGET (${afterError}); graph-copy cleanup is unverified`);
+        return {
+            kind: "forgotten",
+            affected,
+            status: scoped.status,
+            forgottenIds: [],
+            graph: { ...empty, status: "unverified", unverifiable: atRisk ?? before.size },
+            note: "the plugin could not re-read the memory inventory after the forget, so it cannot tell which graph copies belonged to the forgotten memories",
+        };
+    }
+    const forgottenIds = [...before].filter((id) => !after.has(id));
+    const graph = await removeGraphCopies(client, forgottenIds, logger);
+    const reported = typeof affected.episodes === "number" ? affected.episodes : undefined;
+    if (reported !== undefined && reported > forgottenIds.length) {
+        const missing = reported - forgottenIds.length;
+        return {
+            kind: "forgotten",
+            affected,
+            status: scoped.status,
+            forgottenIds,
+            graph: { ...graph, status: "unverified", unverifiable: graph.unverifiable + missing },
+            note: `the engine deleted ${missing} more memory/memories than the inventory listed (stored while the forget ran), and their graph copies could not be identified`,
+        };
+    }
+    return { kind: "forgotten", affected, status: scoped.status, forgottenIds, graph };
+}
+/** Graph copies that exist for any of these ids. Throws if the graph cannot answer. */
+async function countGraphCopiesOf(client, ids) {
+    const unique = [...new Set(ids)];
+    const valid = unique.filter((id) => GRAPH_COPY_ID.test(id));
+    if (valid.length !== unique.length) {
+        // An id that cannot be inlined cannot be counted; never report it as zero.
+        throw new Error("graph-copy count: an id is not safe to inline into Cypher");
+    }
+    let total = 0;
+    const http = graphHttp(client);
+    for (let i = 0; i < valid.length; i += GRAPH_CLEANUP_BATCH) {
+        const inList = valid
+            .slice(i, i + GRAPH_CLEANUP_BATCH)
+            .map((id) => `'${id}'`)
+            .join(", ");
+        total += graphCountOf(await http.post("/graph/match", {
+            sql: `MATCH (m:Memory) WHERE m.id IN [${inList}] RETURN count(m) AS n`,
+        }));
+    }
+    return total;
+}
 /**
  * `linkSimilarMemories` — capture-time graph wiring.
  *
@@ -1899,31 +2210,6 @@ const DEFAULT_RECALL_RELATED_LIMIT = 20;
  * memory subsystem; we just log and move on so the rest of recall keeps
  * working.
  */
-/**
- * Best-effort removal of the `Memory` graph node that `linkSimilarMemories`
- * may have created for a memory, so a forgotten memory leaves no recallable
- * copy behind in the graph. Runs for every backend — the legacy row delete and
- * the memory-object FORGET both leave these plugin-created nodes untouched.
- * Non-fatal, and a no-op when no node exists or the graph is unavailable.
- */
-async function removeGraphCopy(client, id, logger) {
-    // Returns true when the graph copy was removed (or there was nothing to
-    // remove), false when cleanup FAILED — callers surface that instead of
-    // reporting a clean forget while a copy may survive.
-    if (!/^[A-Za-z0-9_-]+$/.test(id))
-        return true;
-    try {
-        const http = client._getHttpClient();
-        await http.post("/graph/match", {
-            sql: `MATCH (m:Memory {id: '${id}'}) DETACH DELETE m`,
-        });
-        return true;
-    }
-    catch (err) {
-        logger?.warn?.(`memory-synapcores: graph-copy cleanup FAILED for ${id}: ${String(err)} (row delete already succeeded; a graph copy may remain)`);
-        return false;
-    }
-}
 async function linkSimilarMemories(entry, client, embedVector, logger) {
     try {
         // KNOWN SDK GAP (@synapcores/sdk@<=0.5.0):
@@ -2343,6 +2629,12 @@ const memoryPlugin = {
             throw new Error(`memory-synapcores: collection '${namespace}' is not a valid namespace ` +
                 `(must match /^[A-Za-z_][A-Za-z0-9_]*$/). Update plugins.entries.memory-synapcores.config.collection.`);
         }
+        // Transport-security gate. parse() above already refused a plaintext
+        // connection to a remote gateway; checking again right here keeps the
+        // guarantee next to the only place the plugin builds a client, so no
+        // request (and no API key) can go out over a transport the config did not
+        // allow.
+        assertSecureTransport(cfg.synapcores);
         const client = new SynapCores({
             host: cfg.synapcores.host,
             port: cfg.synapcores.port,
@@ -2380,20 +2672,13 @@ const memoryPlugin = {
         const extensions = createExtensions(db, router, identities, embeddings, client, cfg.graph, cfg.workspace);
         const autoLinkSimilar = cfg.autoLinkSimilar !== false;
         api.logger.info(`memory-synapcores: plugin registered (host: ${cfg.synapcores.host}:${cfg.synapcores.port}, namespace: ${namespace}, memory: ${memoryObjectName}, backend: ${cfg.memory.backend}, identity: ${cfg.memory.identityFrom}, autoLinkSimilar: ${autoLinkSimilar}, lazy init)`);
-        // Transport-security guard: a non-loopback gateway reached over plaintext
-        // HTTP exposes memory traffic (the API key and recalled personal facts) to
-        // anyone on the network path. Loopback is exempt. We warn rather than
-        // hard-fail so an operator on a trusted private link is not blocked.
-        const transportHost = (cfg.synapcores.host ?? "").trim().toLowerCase();
-        const isLoopbackHost = transportHost === "localhost" ||
-            transportHost === "127.0.0.1" ||
-            transportHost === "::1" ||
-            transportHost === "[::1]" ||
-            transportHost.endsWith(".localhost");
-        if (!cfg.synapcores.useHttps && transportHost && !isLoopbackHost) {
-            api.logger.warn(`memory-synapcores: connecting to remote gateway '${transportHost}' over plaintext ` +
-                `HTTP — memory traffic and the API key are unencrypted on the network path. Set ` +
-                `synapcores.useHttps: true for any non-loopback host.`);
+        // A remote gateway over plain HTTP only gets this far when the operator
+        // set synapcores.allowInsecureHttp: true (assertSecureTransport refuses it
+        // otherwise). Say so at every startup, so the choice stays visible.
+        if (!cfg.synapcores.useHttps && !isLoopbackHost(cfg.synapcores.host)) {
+            api.logger.warn(`memory-synapcores: synapcores.allowInsecureHttp is set, so the plugin connects to ` +
+                `remote gateway '${cfg.synapcores.host}' over plain HTTP: memory traffic and the API ` +
+                `key are unencrypted on the network path. Prefer synapcores.useHttps: true.`);
         }
         /**
          * Render a thrown memory error as a tool result.
@@ -2621,22 +2906,26 @@ const memoryPlugin = {
                     }
                     // Explicitly remove any graph copy of this memory on every backend,
                     // so a forgotten memory is not still reachable via graph relations.
-                    const graphRemoved = await removeGraphCopy(client, memoryId, api.logger);
+                    // Verified by a recount; this also retries the cleanup for a
+                    // memory whose row is already gone.
+                    const graph = await removeGraphCopies(client, [memoryId], api.logger);
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: graphRemoved
+                                text: graph.status === "removed"
                                     ? `Memory ${memoryId} forgotten.`
-                                    : `Memory ${memoryId} was deleted, but its graph copy could not be removed and may still be recallable — retry forget once the gateway graph service is reachable.`,
+                                    : graph.status === "failed"
+                                        ? `Memory ${memoryId} was deleted, but its graph copy could not be removed and may still be recallable — retry forget once the gateway graph service is reachable.`
+                                        : `Memory ${memoryId} was deleted, but the plugin could not confirm that its graph copy is gone, so it may still be recallable — retry forget once the gateway graph service is reachable.`,
                             },
                         ],
                         details: {
                             action: "deleted",
                             id: memoryId,
-                            // Report graph-copy cleanup honestly rather than claiming a
-                            // clean forget when the DETACH DELETE failed.
-                            graphCleanup: graphRemoved ? "removed" : "failed",
+                            // Report graph-copy cleanup honestly: "removed" only after a
+                            // recount confirmed no copy is left.
+                            graphCleanup: graph.status,
                             // FORGET propagates to derived facts, embeddings,
                             // relationships, current-state values and provenance, and
                             // reports the count per category. Legacy deletes one row.
@@ -2649,52 +2938,64 @@ const memoryPlugin = {
                     // resolves the scope semantically, propagates the removal, and
                     // returns a receipt. The legacy path has no such verb, which is
                     // why the search-then-confirm dance below still exists for it.
-                    // Collect the matching memory ids BEFORE forgetting, so we can also
-                    // drop their `Memory` graph copies — scope forget removes rows and
-                    // derived state in the engine but not plugin-created graph nodes.
-                    let candidateIds = [];
+                    // forgetScope() also removes the `Memory` graph copies of every
+                    // episode the FORGET deleted, found by diffing the authoritative
+                    // episode inventory before and after (never a capped recall).
+                    let outcome;
                     try {
-                        const pre = await router.recallForPrompt(query, identity, 25);
-                        candidateIds = pre.results.map((r) => r.entry.id).filter(Boolean);
-                    }
-                    catch {
-                        // best-effort: cleanup proceeds without pre-collected ids
-                    }
-                    let scoped;
-                    try {
-                        scoped = await router.forgetAbout(query, identity);
+                        outcome = await forgetScope(router, client, query, identity, api.logger);
                     }
                     catch (err) {
                         return asToolError(err);
                     }
-                    if (scoped.supported) {
-                        // Explicitly remove the graph copies of the forgotten memories so
-                        // a scope-based forget leaves nothing recallable in the graph.
-                        let graphFailures = 0;
-                        for (const cid of candidateIds) {
-                            if (!(await removeGraphCopy(client, cid, api.logger)))
-                                graphFailures++;
-                        }
-                        const affected = (scoped.affected ?? {});
+                    if (outcome.kind === "inventory_failed") {
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `Nothing was forgotten. The plugin could not list the stored memories ` +
+                                        `(${outcome.reason}), and it needs that list to remove their graph copies ` +
+                                        `along with them. Retry once the gateway is reachable, or forget a specific ` +
+                                        `memory by memoryId.`,
+                                },
+                            ],
+                            details: {
+                                action: "none",
+                                scope: query,
+                                error: "MEMORY_INVENTORY_UNAVAILABLE",
+                                message: outcome.reason,
+                            },
+                        };
+                    }
+                    if (outcome.kind === "forgotten") {
+                        const { affected, graph } = outcome;
                         const total = Object.values(affected).reduce((sum, v) => sum + (typeof v === "number" ? v : 0), 0);
-                        const graphNote = graphFailures > 0
-                            ? ` Note: ${graphFailures} graph copy/copies could not be removed and may remain recallable — retry forget once the graph service is reachable.`
-                            : "";
+                        const graphNote = graph.status === "failed"
+                            ? ` Note: ${graph.remaining} graph copy/copies could not be removed and may remain recallable — once the graph service is reachable, call memory_forget with each memoryId in details.forgottenIds to finish the cleanup.`
+                            : graph.status === "unverified"
+                                ? ` Note: the plugin could not confirm that every graph copy was removed${outcome.note ? ` (${outcome.note})` : ""}, so some may remain recallable.`
+                                : "";
                         return {
                             content: [
                                 {
                                     type: "text",
                                     text: total > 0
                                         ? `Forgot everything about "${query}" (${total} record(s) across episodes, facts, state, relationships and provenance).${graphNote}`
-                                        : `Nothing matching "${query}" was stored.`,
+                                        : `Nothing matching "${query}" was stored.${graphNote}`,
                                 },
                             ],
                             details: {
                                 action: "forgot_scope",
                                 scope: query,
                                 affected,
-                                status: scoped.status,
-                                graphCleanup: graphFailures > 0 ? `failed:${graphFailures}` : "removed",
+                                status: outcome.status,
+                                // "removed" only after a recount confirmed no graph copy of
+                                // any forgotten memory is left; "failed:<n>" / "unverified"
+                                // otherwise.
+                                graphCleanup: graphCleanupLabel(graph),
+                                graphCopiesRemoved: graph.removed,
+                                forgottenCount: outcome.forgottenIds.length,
+                                ...(graph.status === "removed" ? {} : { forgottenIds: outcome.forgottenIds }),
                             },
                         };
                     }
@@ -2706,10 +3007,19 @@ const memoryPlugin = {
                         };
                     }
                     if (results.length === 1 && results[0].score > 0.9) {
-                        await db.delete(results[0].entry.id);
+                        const forgottenId = results[0].entry.id;
+                        await db.delete(forgottenId);
+                        const graph = await removeGraphCopies(client, [forgottenId], api.logger);
                         return {
-                            content: [{ type: "text", text: `Forgotten: "${results[0].entry.text}"` }],
-                            details: { action: "deleted", id: results[0].entry.id },
+                            content: [
+                                {
+                                    type: "text",
+                                    text: graph.status === "removed"
+                                        ? `Forgotten: "${results[0].entry.text}"`
+                                        : `Forgotten: "${results[0].entry.text}" — but its graph copy ${graph.status === "failed" ? "could not be removed" : "could not be confirmed gone"} and may still be recallable; retry with memoryId ${forgottenId} once the gateway graph service is reachable.`,
+                                },
+                            ],
+                            details: { action: "deleted", id: forgottenId, graphCleanup: graph.status },
                         };
                     }
                     const list = results

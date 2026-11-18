@@ -55,11 +55,17 @@
           "useHttps": {
             "type": "boolean",
             "title": "Use HTTPS",
-            "description": "Connect to the SynapCores gateway over TLS.",
+            "description": "Connect to the SynapCores gateway over TLS. Set this for any gateway that is not on this machine (localhost, 127.0.0.0/8, ::1).",
+            "default": false
+          },
+          "allowInsecureHttp": {
+            "type": "boolean",
+            "title": "Allow Plain HTTP to a Remote Gateway",
+            "description": "Off by default. A gateway that is not on this machine needs useHttps unless this is set; config validation names both options. Turn it on only for a gateway on a private network you trust: the API key and memory contents then travel unencrypted. Loopback hosts never need it.",
             "default": false
           }
         },
-        "description": "SynapCores gateway connection. Optional at install time \u2014 the plugin installs without it and reports an actionable error at startup if the gateway is not reachable. apiKey may also be supplied via the SYNAPCORES_API_KEY environment variable."
+        "description": "SynapCores gateway connection. Optional at install time \u2014 the plugin installs without it and reports an actionable error at startup if the gateway is not reachable. apiKey may also be supplied via the SYNAPCORES_API_KEY environment variable. A gateway on another machine connects over HTTPS (useHttps), or over plain HTTP only with allowInsecureHttp."
       },
       "collection": {
         "type": "string",

@@ -73,6 +73,12 @@ export type MemoryConfig = {
         port: number;
         apiKey: string;
         useHttps: boolean;
+        /**
+         * Explicit opt-in to plain HTTP for a NON-loopback gateway. Off by default:
+         * a remote host needs `useHttps: true` unless the operator sets this.
+         * Loopback hosts never need it.
+         */
+        allowInsecureHttp: boolean;
     };
     collection?: string;
     graph?: string;
@@ -97,6 +103,31 @@ export type MemoryConfig = {
 };
 export declare const MEMORY_CATEGORIES: readonly ["preference", "fact", "decision", "entity", "other"];
 export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
+/**
+ * True when `host` can only reach this machine: `localhost`, an address in
+ * 127.0.0.0/8, or ::1 (bracketed or not, plus the IPv4-mapped
+ * `::ffff:127.x.y.z` form). Any other name or address counts as remote,
+ * including names under `.localhost`, because a resolver is not obliged to
+ * keep those on the loopback interface.
+ */
+export declare function isLoopbackHost(host: string): boolean;
+/**
+ * Refuse a plaintext connection to a remote gateway.
+ *
+ * Every request carries the API key and memory content, so a non-loopback
+ * gateway must be reached over TLS (`useHttps: true`) unless the operator has
+ * explicitly accepted plain HTTP with `allowInsecureHttp: true`. Loopback
+ * traffic never leaves the machine and needs neither. Runs at config parse
+ * time (install, startup, `openclaw plugins doctor`) and again immediately
+ * before the SDK client is built, so no request can go out over a refused
+ * transport.
+ */
+export declare function assertSecureTransport(gateway: {
+    host: string;
+    port?: number;
+    useHttps: boolean;
+    allowInsecureHttp?: boolean;
+}): void;
 export declare const memoryConfigSchema: {
     parse(value: unknown): MemoryConfig;
     uiHints: {
@@ -117,6 +148,11 @@ export declare const memoryConfigSchema: {
             help: string;
         };
         "synapcores.useHttps": {
+            label: string;
+            advanced: boolean;
+            help: string;
+        };
+        "synapcores.allowInsecureHttp": {
             label: string;
             advanced: boolean;
             help: string;

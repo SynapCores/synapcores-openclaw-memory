@@ -26,6 +26,7 @@
  * identity design, and what the new backend cannot do.
  */
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import { SynapCores } from "@synapcores/sdk";
 import { type MemoryCategory } from "./config.js";
 /**
  * Internal memory record shape used throughout the plugin. The legacy v0.3.x
@@ -243,6 +244,68 @@ export declare function shouldCapture(text: string): boolean;
  * surrounding quotes (so the helper is composable with template literals).
  */
 export declare function escapeCypherString(value: string): string;
+/**
+ * Outcome of removing the `Memory` graph copies of a set of forgotten memories.
+ *
+ * `status` is only `removed` when a recount CONFIRMED that no copy of any of
+ * the ids is left; it is never inferred from "no error was thrown".
+ * - `removed`: verified — zero copies remain (including when none existed).
+ * - `failed`: verified — `remaining` copies are still in the graph.
+ * - `unverified`: the plugin could not confirm the outcome for `unverifiable`
+ *   ids (graph query failed, or an id was not safe to inline into Cypher).
+ */
+export type GraphCleanupReport = {
+    status: "removed" | "failed" | "unverified";
+    /** Ids whose copies were looked for. */
+    checked: number;
+    /** Copies found before the delete. */
+    found: number;
+    /** Copies confirmed gone (found - remaining, over verified batches). */
+    removed: number;
+    /** Copies confirmed still present after the delete. */
+    remaining: number;
+    /** Ids whose outcome could not be confirmed. */
+    unverifiable: number;
+};
+/**
+ * Remove the `Memory` graph nodes that `linkSimilarMemories` may have created
+ * for these memory ids, then recount to confirm none is left.
+ *
+ * Runs for every backend: the legacy row delete and the memory-object FORGET
+ * both leave these plugin-created nodes untouched. Ids go in batches of
+ * {@link GRAPH_CLEANUP_BATCH} (`WHERE m.id IN [...]`), so the number of ids is
+ * unbounded. Each batch is counted, deleted, and counted again; a batch with no
+ * copies is not touched. Never throws — failures land in the report, which
+ * callers surface instead of claiming a clean forget.
+ */
+export declare function removeGraphCopies(client: SynapCores, ids: Iterable<string>, logger?: {
+    warn?: (msg: string) => void;
+} | undefined): Promise<GraphCleanupReport>;
+/**
+ * What a scope-based forget did, as {@link forgetScope} reports it.
+ *
+ * - `unsupported`: the legacy backend has no scope verb (the caller falls back
+ *   to its search-then-confirm flow).
+ * - `inventory_failed`: the episode inventory could not be read and graph
+ *   copies exist, so NOTHING was deleted — the plugin will not delete memories
+ *   whose graph copies it cannot track.
+ * - `forgotten`: FORGET ran; `graph` reports the copy cleanup, `forgottenIds`
+ *   are the episode ids that left the inventory.
+ */
+export type ScopeForgetOutcome = {
+    kind: "unsupported";
+} | {
+    kind: "inventory_failed";
+    reason: string;
+} | {
+    kind: "forgotten";
+    affected: Record<string, unknown>;
+    status?: string;
+    forgottenIds: string[];
+    graph: GraphCleanupReport;
+    /** Why `graph.status` is `unverified` when the reason is not a graph error. */
+    note?: string;
+};
 /**
  * Build the runtime extension surface exposed on the plugin instance. These
  * methods are exported via `memoryPlugin.extensions` so callers can reach

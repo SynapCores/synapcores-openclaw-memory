@@ -64,6 +64,12 @@ export SYNAPCORES_API_KEY="aidb_…"
 export SYNAPCORES_URL="http://127.0.0.1:8080"
 ```
 
+For a gateway on another machine, use its `https://` address instead, so the
+key and your memories stay encrypted on the network. The helper below checks
+this for you: it accepts `https://` anywhere and plain `http://` on this machine
+(`localhost`, `127.0.0.1`, `[::1]`). For a gateway on a private network you
+trust, `export SYNAPCORES_ALLOW_INSECURE_HTTP=1` lets it use plain `http://`.
+
 The first `MEMORY_STORE` below doubles as your connectivity check — a `401`
 means the key is wrong, and a connection error means the gateway is not up yet.
 
@@ -74,6 +80,15 @@ shell session:
 
 ```bash
 sc() {
+  # The API key rides on every request: keep it on this machine or on TLS.
+  case "$SYNAPCORES_URL" in
+    *@*) echo "sc: SYNAPCORES_URL must not contain '@'" >&2; return 1 ;;
+    https://*|http://localhost|http://localhost[:/]*|http://127.0.0.1|http://127.0.0.1[:/]*|http://\[::1\]|http://\[::1\][:/]*) ;;
+    *) [ "$SYNAPCORES_ALLOW_INSECURE_HTTP" = 1 ] || {
+         echo "sc: use an https:// SYNAPCORES_URL for a gateway on another machine" \
+              "(or set SYNAPCORES_ALLOW_INSECURE_HTTP=1 for a private network you trust)" >&2
+         return 1; } ;;
+  esac
   curl -s -m 120 -X POST "$SYNAPCORES_URL/v1/query/execute" \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer $SYNAPCORES_API_KEY" \
