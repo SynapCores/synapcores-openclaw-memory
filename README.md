@@ -126,13 +126,14 @@ npm install @synapcores/openclaw-memory
 You need a running SynapCores gateway. The Community Edition is free:
 
 ```bash
-# Linux/macOS one-liner installer (see https://synapcores.com/install)
-curl -fsSL https://synapcores.com/install.sh | sh
-# Then start it:
-synapcores start
+# Linux (x86_64, aarch64) and macOS on Apple Silicon; on Windows, run it inside WSL2 (Ubuntu).
+# More options, including Docker: https://synapcores.com/download
+curl -fsSL https://get.synapcores.com | SYNAPCORES_REF=openclaw-memory sh
 ```
 
-Create an API key from the SynapCores admin UI (default `http://localhost:8095`) and copy it into your OpenClaw config below.
+When it finishes, the installer prints your next steps, including the web UI address and how to get the first-boot admin login.
+
+Create an API key from the SynapCores admin UI (default `http://localhost:8080`) and copy it into your OpenClaw config below.
 
 ## Configure
 
