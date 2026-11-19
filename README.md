@@ -296,9 +296,9 @@ This plugin is **privacy-safe by default and passive out of the box.**
 | `memory.tokenBudget` | no | `512` | `token_budget` for prompt-injection `RECALL`. |
 | `memory.sourceType` | no | `user_statement` | Claim authority for `memory_store` writes. |
 | `memory.create` | no | `{}` | `CREATE MEMORY ... WITH (...)` tuning applied only when the plugin creates the object. All optional; anything unset stays on the engine default. Keys: `forAgent` (→ `FOR AGENT`), `embeddingModel`, `dimensions`, `llmExtraction`, `episodic`, `semantic`, `temporal`, `relationships`, `provenance`, `consolidation`, `consolidateOnSessionEnd`, `consolidateAfterEpisodes`, `retainRawEpisodes`, `singularAttributes`. **Pin `embeddingModel`+`dimensions` to your gateway's EMBED model — a mismatch silently breaks semantic recall.** |
-| `autoCapture` | no | `true` | Auto-store memorable utterances after each agent turn. |
-| `autoRecall` | no | `true` | Auto-inject relevant memories before each agent turn. |
-| `autoLinkSimilar` | no | `true` | On capture, insert each Memory as a graph node carrying the embedding so `recallRelated` returns useful neighborhoods out of the box. Adds ~30-50ms per capture; disable if you never call `recallRelated`. |
+| `autoCapture` | no | `false` | Opt-in. Auto-store memorable utterances after each agent turn. |
+| `autoRecall` | no | `false` | Opt-in. Auto-inject relevant memories before each agent turn. |
+| `autoLinkSimilar` | no | `false` | Opt-in; takes effect only when `autoCapture` is on. On capture, insert each Memory as a graph node carrying the embedding so `recallRelated` returns useful neighborhoods. Adds ~30-50ms per capture. |
 | `workspace` | no | — | Optional workspace suffix on the AutoML relevance model name so multiple installations sharing one gateway can train independent models. |
 
 ## Identity — who a memory belongs to
