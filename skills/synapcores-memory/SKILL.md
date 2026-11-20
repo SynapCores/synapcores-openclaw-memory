@@ -29,7 +29,7 @@ Long-term memory for the agent, stored in a database you run yourself. Memories
 are embedded on write and retrieved by meaning, not keywords — "what coffee does
 he like" finds "prefers dark roast" without sharing a single word.
 
-Nothing leaves the machine. Embeddings are computed inside the engine; there is
+Your data never leaves the machine. Embeddings are computed inside the engine; there is
 no external API key and no third-party service in the path.
 
 ## When to use this
@@ -48,9 +48,10 @@ the published tag can never be swapped under you:
 ```bash
 docker run -d --name synapcores -p 127.0.0.1:8080:8080 \
   -v synapcores-data:/var/lib/synapcores \
-  -e SYNAPCORES_TELEMETRY=off \
   ghcr.io/synapcores/community:v2.5.1-ce@sha256:c2a583fef157b3d6afab1844641d95185d4893ac5a8f1268aa56f7af40707f1a
 ```
+
+SynapCores sends an anonymous install/heartbeat ping (version, OS, a random install id; never data, queries or prompts); add `-e SYNAPCORES_TELEMETRY=off` to turn it off.
 
 On first boot the gateway prints **your own** admin login and a starter API key
 to its own startup console. Read that startup output on your machine and copy
