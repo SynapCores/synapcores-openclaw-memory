@@ -29,13 +29,14 @@ Long-term memory for the agent, stored in a database you run yourself. Memories
 are embedded on write and retrieved by meaning, not keywords — "what coffee does
 he like" finds "prefers dark roast" without sharing a single word.
 
-Your data never leaves the machine. Embeddings are computed inside the engine; there is
-no external API key and no third-party service in the path.
+Your data stays in the SynapCores gateway you run, which is on this machine unless you
+point `SYNAPCORES_URL` at a server of your own. Embeddings are computed inside the engine;
+there is no external API key and no third-party service in the path.
 
 ## When to use this
 
 - The user says "remember that…", "don't forget…", "for future reference…"
-- The user asks "what do you know about…", "what did I tell you about…"
+- The user asks "what do you remember about…", "what did I tell you about…"
 - The user corrects or retracts something you stored
 - You need context from an earlier session
 
@@ -55,8 +56,8 @@ SynapCores sends an anonymous install/heartbeat ping (version, OS, a random inst
 
 On first boot the gateway prints **your own** admin login and a starter API key
 to its own startup console. Read that startup output on your machine and copy
-the `aidb_…` API key it shows. It is your credential on your own machine — the
-plugin only ever sends it to your local gateway, never anywhere else.
+the `aidb_…` API key it shows. It is your credential — the
+plugin only ever sends it to your own gateway, never anywhere else.
 
 **2. Export the key and the gateway URL:**
 
